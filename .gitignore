@@ -2,4 +2,11 @@
 **/build
 *.asv
 **/.metadata
-**/Debug
+**/Debug/
+**/Release/
+**/.settings/
+**/*.launch
+*.swp
+*~
+.DS_Store
+Thumbs.db

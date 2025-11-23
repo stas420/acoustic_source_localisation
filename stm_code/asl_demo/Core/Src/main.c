@@ -21,17 +21,65 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "arm_math.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef struct coords_3D_t {
+    float x;
+    float y;
+    float z;
+} coords_3D_t;
 
+typedef struct angle_pair_t {
+    float az;
+    float el;
+} angle_pair_t;
+
+typedef struct tdoa_per_mic_per_doa_t {
+    q31_t tau;
+    uint8_t mic_idx;
+    uint16_t angle_pair_idx;
+} tdoa_per_mic_per_doa_t;
+
+typedef struct q31_cpx_t {
+	q31_t r;
+	q31_t i;
+} q31_cpx_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define M 16                    /* num of mics */
+#define Ny 4                    /* num of mics in y column */
+#define Nz 4                    /* num of mics in z row */
+#define C 343                   /* speed of sound in m/s */
+#define d 0.042                 /* spacing between mics */
+#define F_MIN 300               /* minimum freq considered in Hz */
+#define F_MAX 3000              /* minimum freq considered in Hz */
+#define F_S 16000               /* incoming signal sampling rate */
+#define L 512                   /* x_m microphone's signal frame length - TO BE DETERMINED */
+#define R 10                    /* angualar grid resolution in degrees */
+#define AZ_LOW -90              /* min azimuth angle conidered in degrees */
+#define AZ_HIGH 90              /* max azimuth angle conidered in degrees */
+#define EL_LOW -90              /* min elevation angle considered in degrees */
+#define EL_HIGH 90              /* max elevation angle considered in degrees */
 
+#ifndef PI
+	#define PI 3.141592653589793238 /* pi approximation */
+#endif
+
+#define EPS ((q31_t) 1)        /* epsilon value for numerical stability */
+
+#define F_NYQ (F_S / 2)                                     /* Nyquist frequency */
+#define REAL_FFT_LEN ((L/2) + 1)                            /* length of the output of real-valued signal's FFT, which is of use */
+#define ALL_AZIMUTHS ((AZ_HIGH - AZ_LOW)/R + 1)             /* size of azimuth grid */
+#define ALL_ELEVATIONS ((EL_HIGH - EL_LOW)/R + 1)           /* size of elevation grid */
+#define ALL_POSSIBLE_DOAS (ALL_AZIMUTHS * ALL_ELEVATIONS)   /* size of all DoAs grid (i.e. every possible pair of {az,el}) */
+
+#define Q31_SIZE_BYTES (sizeof(q31_t))
+#define SPI_DATA_BUFF_LEN (M * L * Q31_SIZE_BYTES)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -43,24 +91,244 @@
 
 SPI_HandleTypeDef hspi1;
 
-UART_HandleTypeDef huart3;
-
 /* USER CODE BEGIN PV */
+const coords_3D_t mics_positions[M] = {
+	{ 0,   0, 3*d }, { 0,   0, 2*d }, { 0,   0, d }, { 0,   0, 0 },
+	{ 0,   d, 3*d }, { 0,   d, 2*d }, { 0,   d, d }, { 0,   d, 0 },
+	{ 0, 2*d, 3*d }, { 0, 2*d, 2*d }, { 0, 2*d, d }, { 0, 2*d, 0 },
+	{ 0, 3*d, 3*d }, { 0, 3*d, 2*d }, { 0, 3*d, d }, { 0, 3*d, 0 },
+};
 
+angle_pair_t all_possible_doas_lut[ALL_POSSIBLE_DOAS];
+tdoa_per_mic_per_doa_t all_relative_tdoas_lut[(ALL_POSSIBLE_DOAS * M)];
+
+uint16_t low_fft_bin_idx = 0;
+uint16_t high_fft_bin_idx = 0;
+float fft_bins_lut[REAL_FFT_LEN];
+
+uint8_t spi_mic_data_buff[SPI_DATA_BUFF_LEN];
+q31_t q31_mic_data_buff[M][L];
+q31_t q31_mic_data_fft_buff[M][L];
+
+float srp_phat_mic_per_doa[ALL_POSSIBLE_DOAS];
+
+arm_rfft_instance_q31 rfft;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_SPI1_Init(void);
-static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static inline float deg2rad(float arg_deg) {
+    return (arg_deg * (float)(PI / 180.0f));
+}
 
+static inline float rad2deg(float arg_rad) {
+    return (arg_rad * (float)(180.0f / PI));
+}
+
+static void prepare_luts(void) {
+    coords_3D_t sphere_vec;
+    uint16_t doa_idx = 0U;
+    uint32_t tdoa_idx = 0U;
+    uint16_t el_idx = 0U;
+    uint8_t mic_idx = 0U;
+    float az_rad = 0.0f;
+    float el_rad = 0.0f;
+    float tmp_tau = 0.0f;
+
+    /* for every azimuth degree step */
+    for (uint16_t az_idx = 0; az_idx < ALL_AZIMUTHS; az_idx++) {
+        /* and for every elevation degree step */
+        for (el_idx = 0; el_idx < ALL_ELEVATIONS; el_idx++) {
+            /* define an entry in degree-grid */
+            all_possible_doas_lut[doa_idx].az = (float) (AZ_LOW + (az_idx * R));
+            all_possible_doas_lut[doa_idx].el = (float) (EL_LOW + (el_idx * R));
+
+            /* Convert to radians ONCE for this DoA */
+            az_rad = deg2rad(all_possible_doas_lut[doa_idx].az);
+            el_rad = deg2rad(all_possible_doas_lut[doa_idx].el);
+
+            /* 0th element is our ref, so it's zero all the time */
+            all_relative_tdoas_lut[tdoa_idx].angle_pair_idx = doa_idx;
+            all_relative_tdoas_lut[tdoa_idx].mic_idx = (uint8_t) 0U;
+            all_relative_tdoas_lut[tdoa_idx].tau = (q31_t) 0U;
+            tdoa_idx++;
+
+            /* Calculate spherical direction vector according to MATLAB convention:
+             * d_hat(1) = cos(theta) * cos(phi)   where theta=elevation, phi=azimuth
+             * d_hat(2) = cos(theta) * sin(phi)
+             * d_hat(3) = sin(theta)
+             */
+            sphere_vec.x = cosf(el_rad) * cosf(az_rad);
+            sphere_vec.y = cosf(el_rad) * sinf(az_rad);
+            sphere_vec.z = sinf(el_rad);
+
+            /* every other mic's relative TDoA is calculated relatively to 0th mic */
+            for (mic_idx = 1; mic_idx < M; mic_idx++) {
+                all_relative_tdoas_lut[tdoa_idx].angle_pair_idx = doa_idx;
+                all_relative_tdoas_lut[tdoa_idx].mic_idx = mic_idx;
+                tmp_tau = (float) (
+                    (sphere_vec.x * (mics_positions[mic_idx].x - mics_positions[0].x))
+                  + (sphere_vec.y * (mics_positions[mic_idx].y - mics_positions[0].y))
+                  + (sphere_vec.z * (mics_positions[mic_idx].z - mics_positions[0].z))
+                ) / ((float) C);
+                arm_float_to_q31(&tmp_tau, &(all_relative_tdoas_lut[tdoa_idx].tau), (uint32_t) 1U);
+                tdoa_idx++;
+            }
+
+            doa_idx++;
+        }
+    }
+
+    /* prepare every FFT bin and indicators */
+    low_fft_bin_idx = 0U;
+    high_fft_bin_idx = 0U;
+
+    for (uint16_t k = 0U; k < REAL_FFT_LEN; k++) {
+        fft_bins_lut[k] = k * ((float)F_S / (float)L);
+
+        // Count bins below F_MIN
+        if (fft_bins_lut[k] < F_MIN) {
+        	low_fft_bin_idx++;
+        }
+
+        // Count bins up to AND including F_MAX
+        if (fft_bins_lut[k] <= F_MAX) {
+        	high_fft_bin_idx = k + 1U;  // Set to NEXT index (for < comparison in loop)
+        }
+    }
+}
+
+static void convert_buffer(void) {
+	static union {
+		uint8_t u8[4];
+		q31_t q31;
+	} conv;
+
+	uint32_t mic_frame_i = 0U;
+	uint32_t spi_i = 0U;
+
+	while (spi_i < (uint32_t) SPI_DATA_BUFF_LEN) {
+		for (uint32_t mic_i = 0U; mic_i < (uint32_t) M; mic_i++) {
+			conv.u8[0] = spi_mic_data_buff[spi_i];
+			spi_i++;
+			conv.u8[1] = spi_mic_data_buff[spi_i];
+			spi_i++;
+			conv.u8[2] = spi_mic_data_buff[spi_i];
+			spi_i++;
+			conv.u8[3] = spi_mic_data_buff[spi_i];
+			spi_i++;
+
+			q31_mic_data_buff[mic_i][mic_frame_i] = conv.q31;
+		}
+		mic_frame_i++;
+	}
+}
+
+static angle_pair_t srp_phat(void) {
+	angle_pair_t ret_doa;
+
+	/* -- 1. rfft -- */
+	for (uint8_t m = 0U; m < M; m++) {
+		arm_rfft_q31(&rfft, &q31_mic_data_buff[m][0], &q31_mic_data_fft_buff[m][0]);
+	}
+
+	/* -- 2. SRP-PHAT map init -- */
+	for (uint32_t i = 0U; i < ALL_POSSIBLE_DOAS; i++) {
+		srp_phat_mic_per_doa[i] = 0.0f;
+	}
+
+	/* -- 3. compute the core map of SRP-PHAT -- */
+	uint32_t doa_idx = 0U;
+	q31_t tau_ml = (q31_t) 0;
+	q31_t gcc_phat_sum[2] = { 0 };  // Akumulator dla pary mic [Re, Im]
+	q31_t tmp_cpx_conj[2] = { 0 };
+	q31_t tmp_cross_spec[2] = { 0 };
+	q31_t tmp_cross_spec_abs = (q31_t) 0;
+	q31_t exp_phase[2] = { 0 };
+	q31_t result[2] = { 0 };
+	q31_t phase_q31 = 0;
+	float tau_float = 0.0f;
+	float phase = 0.0f;
+	float omega = 0.0f;
+	q63_t tmp_gcc_pow = 0;
+
+	/* for each DoA... */
+	for (uint32_t doa = 0U; doa < ALL_POSSIBLE_DOAS; doa++) {
+		doa_idx = doa * ((uint32_t) M);
+
+		/* ...and for each mic pair ml, l > m... */
+		for (uint8_t mic_m = 0U; mic_m < M; mic_m++) {
+			for (uint8_t mic_l = mic_m + 1U; mic_l < M; mic_l++) {
+
+				/* Reset akumulatora GCC-PHAT dla tej pary mikrofonów */
+				gcc_phat_sum[0] = 0;
+				gcc_phat_sum[1] = 0;
+
+				/* ...and for each freq bin of interest... */
+				for (uint16_t k = low_fft_bin_idx; k < high_fft_bin_idx; k++) {
+					/* ...we do a GCC-PHAT: */
+					/* pre-calc conj */
+					arm_cmplx_conj_q31(&q31_mic_data_fft_buff[mic_m][2*k], tmp_cpx_conj, 1U);
+					/* calc cross-spectrum */
+					arm_cmplx_mult_cmplx_q31(&q31_mic_data_fft_buff[mic_l][2*k],
+											 tmp_cpx_conj,
+											 tmp_cross_spec, 1U);
+					/* calc this cross-spectrum magnitude */
+					arm_cmplx_mag_q31(tmp_cross_spec, &tmp_cross_spec_abs, 1U);
+
+					/* for numerical stability - if it's zero or near-zero, skip */
+					if (tmp_cross_spec_abs > EPS) {
+						/* perform PHAT part - normalizacja */
+						arm_divide_q31(tmp_cross_spec[0], tmp_cross_spec_abs, &tmp_cross_spec[0], NULL);
+						arm_divide_q31(tmp_cross_spec[1], tmp_cross_spec_abs, &tmp_cross_spec[1], NULL);
+
+						/* oblicz tau_ml dla tej pary mikrofonów i tego DoA */
+						tau_ml = __QSUB(all_relative_tdoas_lut[doa_idx + mic_l].tau,
+										all_relative_tdoas_lut[doa_idx + mic_m].tau);
+
+						/* Oblicz fazę: omega * tau */
+						omega = 2.0f * PI * fft_bins_lut[k];
+						arm_q31_to_float(&tau_ml, &tau_float, 1U);
+						phase = omega * tau_float;
+
+						/* Oblicz e^(j*phase) w Q31 */
+						arm_float_to_q31(&phase, &phase_q31, 1U);
+						exp_phase[0] = arm_cos_q31(phase_q31);  // Re
+						exp_phase[1] = arm_sin_q31(phase_q31);  // Im
+
+						/* Mnożenie: tmp_cross_spec * exp_phase */
+						arm_cmplx_mult_cmplx_q31(tmp_cross_spec, exp_phase, result, 1U);
+
+						/* Akumuluj wynik (sumuj po częstotliwościach) */
+						gcc_phat_sum[0] = __QADD(gcc_phat_sum[0], result[0]);
+						gcc_phat_sum[1] = __QADD(gcc_phat_sum[1], result[1]);
+					}
+				}
+
+				/* Po zsumowaniu po częstotliwościach, oblicz moc (|gcc_phat_sum|^2) */
+				arm_power_q31(gcc_phat_sum, 2U, &tmp_gcc_pow);
+
+				/* Dodaj do mapy SRP dla tego DoA (konwersja Q63 -> float) */
+				srp_phat_mic_per_doa[doa] += (float)((double)tmp_gcc_pow / ((double)(1LL << 63)));
+			}
+		}
+	}
+
+	/* -- 4. return maximum from computed map -- */
+	float tmp_dummy = 0.0f;
+	arm_max_f32(srp_phat_mic_per_doa, (uint32_t) ALL_POSSIBLE_DOAS, &tmp_dummy, &doa_idx);
+	ret_doa = all_possible_doas_lut[doa_idx];
+
+	return ret_doa;
+}
 /* USER CODE END 0 */
 
 /**
@@ -87,21 +355,39 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+  prepare_luts();
+
+  #if L == 512
+    (void) arm_rfft_init_512_q31(&rfft, 0U, 0U);
+  #else
+	(void) arm_rfft_init_q31(&rfft, (uint32_t) L, 0U, 0U);
+  #endif
 
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_SPI1_Init();
-  MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
-
+  const uint32_t spi_timeout = 100U;
+  HAL_StatusTypeDef status = HAL_OK;
+  angle_pair_t doa;
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+	status = HAL_SPI_Receive(&hspi1, spi_mic_data_buff, (uint32_t) SPI_DATA_BUFF_LEN, spi_timeout);
+
+	if (status == HAL_OK) {
+		convert_buffer();
+		doa = srp_phat();
+		// send doa thru UART
+	}
+	else {
+
+	}
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -184,10 +470,10 @@ static void MX_SPI1_Init(void)
   hspi1.Instance = SPI1;
   hspi1.Init.Mode = SPI_MODE_SLAVE;
   hspi1.Init.Direction = SPI_DIRECTION_2LINES_RXONLY;
-  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.DataSize = SPI_DATASIZE_32BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.NSS = SPI_NSS_HARD_INPUT;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -209,54 +495,6 @@ static void MX_SPI1_Init(void)
   /* USER CODE BEGIN SPI1_Init 2 */
 
   /* USER CODE END SPI1_Init 2 */
-
-}
-
-/**
-  * @brief USART3 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART3_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART3_Init 0 */
-
-  /* USER CODE END USART3_Init 0 */
-
-  /* USER CODE BEGIN USART3_Init 1 */
-
-  /* USER CODE END USART3_Init 1 */
-  huart3.Instance = USART3;
-  huart3.Init.BaudRate = 115200;
-  huart3.Init.WordLength = UART_WORDLENGTH_8B;
-  huart3.Init.StopBits = UART_STOPBITS_1;
-  huart3.Init.Parity = UART_PARITY_NONE;
-  huart3.Init.Mode = UART_MODE_TX;
-  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
-  huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart3.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-  huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetTxFifoThreshold(&huart3, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetRxFifoThreshold(&huart3, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_DisableFifoMode(&huart3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART3_Init 2 */
-
-  /* USER CODE END USART3_Init 2 */
 
 }
 
@@ -346,6 +584,14 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   GPIO_InitStruct.Alternate = GPIO_AF11_ETH;
   HAL_GPIO_Init(RMII_TXD1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PD8 PD9 */
+  GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF7_USART3;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
   /*Configure GPIO pin : PG4 */
   GPIO_InitStruct.Pin = GPIO_PIN_4;
