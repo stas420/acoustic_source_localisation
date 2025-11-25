@@ -39,8 +39,8 @@ typedef struct angle_pair_t {
 
 typedef struct tdoa_per_mic_per_doa_t {
     float32_t tau;              // Changed to float for consistency
-    uint8_t mic_idx;
     uint16_t angle_pair_idx;
+    uint8_t mic_idx;
 } tdoa_per_mic_per_doa_t;
 /* USER CODE END PTD */
 
@@ -94,7 +94,7 @@ typedef struct tdoa_per_mic_per_doa_t {
 SPI_HandleTypeDef hspi1;
 
 /* USER CODE BEGIN PV */
-const coords_3D_t mics_positions[M] = {
+static const coords_3D_t mics_positions[M] = {
     {0.0f, -1.5f * d, -1.5f * d},
     {0.0f, -0.5f * d, -1.5f * d},
     {0.0f,  0.5f * d, -1.5f * d},
@@ -116,21 +116,21 @@ const coords_3D_t mics_positions[M] = {
     {0.0f,  1.5f * d,  1.5f * d}
 };
 
-angle_pair_t all_possible_doas_lut[ALL_POSSIBLE_DOAS];
-tdoa_per_mic_per_doa_t all_relative_tdoas_lut[ALL_POSSIBLE_DOAS * M];
+static angle_pair_t all_possible_doas_lut[ALL_POSSIBLE_DOAS];
+static tdoa_per_mic_per_doa_t all_relative_tdoas_lut[ALL_POSSIBLE_DOAS * M];
 
-uint16_t low_fft_bin_idx = 0;
-uint16_t high_fft_bin_idx = 0;
-float32_t fft_bins_lut[REAL_FFT_LEN];
+static uint16_t low_fft_bin_idx = 0;
+static uint16_t high_fft_bin_idx = 0;
+static float32_t fft_bins_lut[REAL_FFT_LEN] __attribute__((aligned(4)));
 
-uint8_t spi_mic_data_buff[SPI_DATA_BUFF_LEN];
-float32_t float_mic_data_buff[M][L];
-float32_t float_mic_data_fft_buff[M][L];
-float32_t hann_window[L];
+static uint8_t spi_mic_data_buff[SPI_DATA_BUFF_LEN] __attribute__((aligned(4)));
+static float32_t float_mic_data_buff[M][L] __attribute__((aligned(4)));
+static float32_t float_mic_data_fft_buff[M][L] __attribute__((aligned(4)));
+static float32_t hann_window[L] __attribute__((aligned(4)));
 
-float32_t srp_phat_map[ALL_POSSIBLE_DOAS];
+static float32_t srp_phat_map[ALL_POSSIBLE_DOAS] __attribute__((aligned(4)));
 
-arm_rfft_fast_instance_f32 rfft_f32;
+static arm_rfft_fast_instance_f32 rfft_f32;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -154,7 +154,7 @@ static inline float32_t deg2rad(float32_t arg_deg) {
  * @brief Convert radians to degrees
  */
 static inline float32_t rad2deg(float32_t arg_rad) {
-    return (float32_t) (arg_rad * (180.0f / PI));
+    return (float32_t)(arg_rad * (180.0f / PI));
 }
 
 /**
@@ -278,7 +278,7 @@ static void convert_buffer(void) {
  *       { Re[0], Im[0], Re[1], Im[1], ... Re[L], Im[L] }
  *       DC (k=0) and Nyquist (k=256) have no imaginary part
  */
-static inline void get_fft_bin(const float32_t* fft_buff, uint16_t k, float32_t* out_re_im) {
+static void get_fft_bin(const float32_t* fft_buff, uint16_t k, float32_t* out_re_im) {
     if (k == 0) {
         out_re_im[0] = fft_buff[0];
         out_re_im[1] = fft_buff[1];  // Im[0] is typically 0 but stored at index 1
@@ -304,7 +304,7 @@ static angle_pair_t srp_phat(void) {
     for (uint8_t m = 0U; m < M; m++) {
     	/* but also window the signal, for better data */
     	arm_mult_f32(&float_mic_data_buff[m][0], hann_window, &float_mic_data_buff[m][0], (uint32_t) L);
-        arm_rfft_fast_f32(&rfft_f32, float_mic_data_buff[m], float_mic_data_fft_buff[m], 0);
+        arm_rfft_fast_f32(&rfft_f32, &float_mic_data_buff[m][0], &float_mic_data_fft_buff[m][0], 0U);
     }
 
     /* -- 2. SRP-PHAT map init -- */
@@ -453,7 +453,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	status = HAL_SPI_Receive(&hspi1, spi_mic_data_buff, (uint32_t) SPI_DATA_BUFF_LEN, spi_timeout);
+	status = HAL_SPI_Receive(&hspi1, spi_mic_data_buff, (uint16_t) SPI_DATA_BUFF_LEN, spi_timeout);
 
 	if (status == HAL_OK) {
 		convert_buffer();
