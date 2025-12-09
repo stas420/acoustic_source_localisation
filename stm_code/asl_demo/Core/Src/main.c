@@ -22,15 +22,17 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "arm_math.h"
+#include "test_data.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-typedef struct coords_3D_t {
-    float32_t x;
-    float32_t y;
-    float32_t z;
-} coords_3D_t;
+
+//typedef struct coords_3D_t {
+//    float32_t x;
+//    float32_t y;
+//    float32_t z;
+//} coords_3D_t;
 
 typedef struct angle_pair_t {
     float32_t az;
@@ -73,15 +75,14 @@ typedef struct tdoa_per_mic_per_doa_t {
 #define ALL_ELEVATIONS ((EL_HIGH - EL_LOW)/R + 1)           /* size of elevation grid */
 #define ALL_POSSIBLE_DOAS (ALL_AZIMUTHS * ALL_ELEVATIONS)   /* size of all DoAs grid */
 
-#define Q31_SIZE_BYTES (sizeof(int32_t))
-#define SPI_DATA_BUFF_LEN (M * L * Q31_SIZE_BYTES)
+#define SAMPLE_SIZE_BYTES 4U
 
 /* Scaling factor for CIC filter output (PDM to PCM conversion)
  * CIC filters typically have gain = (R*M)^N where R=decimation, M=differential delay, N=stages
  * Adjust this based on your actual CIC configuration to prevent clipping
  * Typical range: 1.0f (no scaling) to 1e-6f (heavy decimation)
  */
-#define CIC_SCALE_FACTOR (1.0f / 2147483648.0f)  /* TODO - possible change here, needs research */
+#define CIC_SCALE_FACTOR (1.0f / ((float) (1 << 23)))  /* TODO - possible change here, needs research */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -92,29 +93,32 @@ typedef struct tdoa_per_mic_per_doa_t {
 /* Private variables ---------------------------------------------------------*/
 
 SPI_HandleTypeDef hspi1;
+DMA_HandleTypeDef handle_GPDMA1_Channel0;
 
 /* USER CODE BEGIN PV */
-static const coords_3D_t mics_positions[M] = {
-    {0.0f, -1.5f * d, -1.5f * d},
-    {0.0f, -0.5f * d, -1.5f * d},
-    {0.0f,  0.5f * d, -1.5f * d},
-    {0.0f,  1.5f * d, -1.5f * d},
+//const coords_3D_t mics_positions[M] = {
+//    {0.0f, -1.5f * d, -1.5f * d},
+//    {0.0f, -0.5f * d, -1.5f * d},
+//    {0.0f,  0.5f * d, -1.5f * d},
+//    {0.0f,  1.5f * d, -1.5f * d},
+//
+//    {0.0f, -1.5f * d, -0.5f * d},
+//    {0.0f, -0.5f * d, -0.5f * d},
+//    {0.0f,  0.5f * d, -0.5f * d},
+//    {0.0f,  1.5f * d, -0.5f * d},
+//
+//    {0.0f, -1.5f * d,  0.5f * d},
+//    {0.0f, -0.5f * d,  0.5f * d},
+//    {0.0f,  0.5f * d,  0.5f * d},
+//    {0.0f,  1.5f * d,  0.5f * d},
+//
+//    {0.0f, -1.5f * d,  1.5f * d},
+//    {0.0f, -0.5f * d,  1.5f * d},
+//    {0.0f,  0.5f * d,  1.5f * d},
+//    {0.0f,  1.5f * d,  1.5f * d}
+//};
 
-    {0.0f, -1.5f * d, -0.5f * d},
-    {0.0f, -0.5f * d, -0.5f * d},
-    {0.0f,  0.5f * d, -0.5f * d},
-    {0.0f,  1.5f * d, -0.5f * d},
-
-    {0.0f, -1.5f * d,  0.5f * d},
-    {0.0f, -0.5f * d,  0.5f * d},
-    {0.0f,  0.5f * d,  0.5f * d},
-    {0.0f,  1.5f * d,  0.5f * d},
-
-    {0.0f, -1.5f * d,  1.5f * d},
-    {0.0f, -0.5f * d,  1.5f * d},
-    {0.0f,  0.5f * d,  1.5f * d},
-    {0.0f,  1.5f * d,  1.5f * d}
-};
+enum { SPI_CPLT, SPI_BUSY } spi_status;
 
 static angle_pair_t all_possible_doas_lut[ALL_POSSIBLE_DOAS];
 static tdoa_per_mic_per_doa_t all_relative_tdoas_lut[ALL_POSSIBLE_DOAS * M];
@@ -123,8 +127,8 @@ static uint16_t low_fft_bin_idx = 0;
 static uint16_t high_fft_bin_idx = 0;
 static float32_t fft_bins_lut[REAL_FFT_LEN] __attribute__((aligned(4)));
 
-static uint8_t spi_mic_data_buff[SPI_DATA_BUFF_LEN] __attribute__((aligned(4)));
-static float32_t float_mic_data_buff[M][L] __attribute__((aligned(4)));
+static int32_t spi_mic_data_buff[M * L] __attribute__((aligned(4)));
+//static float32_t float_mic_data_buff[M][L] __attribute__((aligned(4)));
 static float32_t float_mic_data_fft_buff[M][L] __attribute__((aligned(4)));
 static float32_t hann_window[L] __attribute__((aligned(4)));
 
@@ -136,6 +140,7 @@ static arm_rfft_fast_instance_f32 rfft_f32;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_GPDMA1_Init(void);
 static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
 
@@ -143,6 +148,11 @@ static void MX_SPI1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi) {
+	spi_status = SPI_CPLT;
+}
+
+
 /**
  * @brief Convert degrees to radians
  */
@@ -237,36 +247,36 @@ static void prepare_luts(void) {
  * @note CIC filter output is typically in Q31 format (32-bit signed integer)
  *       We convert to float [-1.0, 1.0] for FPU-optimized processing
  */
-static void convert_buffer(void) {
-    union {
-        uint8_t u8[4];
-        int32_t i32;
-    } conv;
-
-    uint32_t mic_frame_i = 0U;
-    uint32_t spi_i = 0U;
-
-    /* incoming SPI data format is as follows:
-     * [mic0_sample0, mic1_sample0, ..., mic15_sample0, mic0_sample1, ...]
-     * each sample is 4 bytes - a 32-bit signed integer from CIC filter
-     */
-    while (spi_i < SPI_DATA_BUFF_LEN) {
-        for (uint32_t mic_i = 0U; mic_i < M; mic_i++) {
-        	/* MSB data format? */
-            conv.u8[3] = spi_mic_data_buff[spi_i];
-            spi_i++;
-            conv.u8[2] = spi_mic_data_buff[spi_i];
-            spi_i++;
-            conv.u8[1] = spi_mic_data_buff[spi_i];
-            spi_i++;
-            conv.u8[0] = spi_mic_data_buff[spi_i];
-            spi_i++;
-
-            float_mic_data_buff[mic_i][mic_frame_i] = ((float)conv.i32) * CIC_SCALE_FACTOR;
-        }
-        mic_frame_i++;
-    }
-}
+//static void convert_buffer(void) {
+//    union {
+//        uint8_t u8[4];
+//        int32_t i32;
+//    } conv;
+//
+//    uint32_t mic_frame_i = 0U;
+//    uint32_t spi_i = 0U;
+//
+//    /* incoming SPI data format is as follows:
+//     * [mic0_sample0, mic1_sample0, ..., mic15_sample0, mic0_sample1, ...]
+//     * each sample is 4 bytes - a 32-bit signed integer from CIC filter
+//     */
+//    while (spi_i < SPI_DATA_BUFF_LEN) {
+//        for (uint32_t mic_i = 0U; mic_i < M; mic_i++) {
+//        	/* MSB data format? */
+//            conv.u8[3] = spi_mic_data_buff[spi_i];
+//            spi_i++;
+//            conv.u8[2] = spi_mic_data_buff[spi_i];
+//            spi_i++;
+//            conv.u8[1] = spi_mic_data_buff[spi_i];
+//            spi_i++;
+//            conv.u8[0] = spi_mic_data_buff[spi_i];
+//            spi_i++;
+//
+//            float_mic_data_buff[mic_i][mic_frame_i] = ((float)conv.i32) * CIC_SCALE_FACTOR;
+//        }
+//        mic_frame_i++;
+//    }
+//}
 
 /**
  * @brief get complex FFT bin (Re, Im) from arm_rfft_fast_f32 output
@@ -290,7 +300,8 @@ static void get_fft_bin(const float32_t* fft_buff, uint16_t k, float32_t* out_re
         out_re_im[1] = fft_buff[2 * k + 1];  // Im[k]
     }
 }
-
+// fk = k * F_S/L
+// k = fk  * L /F_S
 /**
  * @brief the core SRP-PHAT algorithm for DoA estimation
  * @return estimated DoA as pair of angles { azimuth, elevation }
@@ -425,6 +436,7 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+  spi_status = SPI_CPLT;
   prepare_luts();
   arm_status arm_stat;
 
@@ -442,27 +454,32 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_GPDMA1_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
   const uint32_t spi_timeout = 100U;
   HAL_StatusTypeDef status = HAL_OK;
   angle_pair_t doa;
+
+  //(void) HAL_SPI_Receive_DMA(&hspi1, (uint8_t*) spi_mic_data_buff, (uint16_t) SPI_DATA_BUFF_LEN);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	status = HAL_SPI_Receive(&hspi1, spi_mic_data_buff, (uint16_t) SPI_DATA_BUFF_LEN, spi_timeout);
-
-	if (status == HAL_OK) {
-		convert_buffer();
-		doa = srp_phat();
+	if (spi_status == SPI_CPLT) {
+		spi_status = SPI_BUSY;
+		//convert_buffer();
+		//doa = srp_phat();
+		arm_rfft_fast_f32(&rfft_f32, &float_mic_data_buff[0][0], &float_mic_data_fft_buff[0][0], 0U);
+		//(void) HAL_SPI_Receive_DMA(&hspi1, (uint8_t*) spi_mic_data_buff, (uint16_t) SPI_DATA_BUFF_LEN);
 		/* TODO: send DoA thru UART! */
 	}
 	else {
 
 	}
+	status = HAL_ERROR;
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -527,6 +544,34 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief GPDMA1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPDMA1_Init(void)
+{
+
+  /* USER CODE BEGIN GPDMA1_Init 0 */
+
+  /* USER CODE END GPDMA1_Init 0 */
+
+  /* Peripheral clock enable */
+  __HAL_RCC_GPDMA1_CLK_ENABLE();
+
+  /* GPDMA1 interrupt Init */
+    HAL_NVIC_SetPriority(GPDMA1_Channel0_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(GPDMA1_Channel0_IRQn);
+
+  /* USER CODE BEGIN GPDMA1_Init 1 */
+
+  /* USER CODE END GPDMA1_Init 1 */
+  /* USER CODE BEGIN GPDMA1_Init 2 */
+
+  /* USER CODE END GPDMA1_Init 2 */
+
+}
+
+/**
   * @brief SPI1 Initialization Function
   * @param None
   * @retval None
@@ -545,7 +590,7 @@ static void MX_SPI1_Init(void)
   hspi1.Instance = SPI1;
   hspi1.Init.Mode = SPI_MODE_SLAVE;
   hspi1.Init.Direction = SPI_DIRECTION_2LINES_RXONLY;
-  hspi1.Init.DataSize = SPI_DATASIZE_32BIT;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
   hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_HARD_INPUT;

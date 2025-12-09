@@ -91,7 +91,7 @@ function [az, el, info] = asl_srp_phat(rxSignal, micPos, fMin, fMax, ...
         end
         
         % normalisation per mics pair number - some say do, some say don't...
-        srp_map(u) = srp_value/n_pairs;
+        srp_map(u) = srp_value; %/n_pairs;
     end
     
     %fprintf('SRP map computed\n');

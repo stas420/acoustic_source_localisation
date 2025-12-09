@@ -12,7 +12,7 @@ function [az, el, info] = asl_music_2d(rxSignal, lambda0, micSpacingYZ, ...
     C = 343;
     fc = C/lambda0;
     fs = 16000;
-    bandwidth_hz = fs/100;
+    bandwidth_hz = 500;
     
     f_low = fc - bandwidth_hz/2;
     f_high = fc + bandwidth_hz/2;
@@ -76,13 +76,14 @@ function [az, el, info] = asl_music_2d(rxSignal, lambda0, micSpacingYZ, ...
         % az { +X : +Y }, el { XY-plane up to +Z}
         
         % along y col : sin(az) * cos(el)
-        a_y = exp(1j * k * micSpacingYZ * (0:(numMicsInRowCol-1))' * sin(az_n) * cos(el_n));
+        a_y = exp(1j * k * micSpacingYZ * (0:(numMicsInRowCol-1))' * (cos(el_n) * sin(az_n)));
         
         % along z rows: sin(el)
         a_z = exp(1j * k * micSpacingYZ * (0:(numMicsInRowCol-1))' * sin(el_n));
-        
+
+        %% TODO
         % kronecker - this depends on mics order << to be reviewed
-        a_az_el_n = kron(a_z, a_y);
+        a_az_el_n = kron(a_y, a_z);
         
         P_MUSIC(n) = 1 / real(a_az_el_n' * U_N_proj * a_az_el_n);
     end

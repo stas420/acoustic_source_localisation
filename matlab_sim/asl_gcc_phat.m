@@ -21,7 +21,7 @@ function g_phat = asl_gcc_phat(X_l, X_m)
     
     cross_spectrum = X_l .* conj(X_m);
     % gonna be adding epsilon for numeric reasons -- [ref. needed!]
-    epsilon = 1e-10;    
+    epsilon = 1e-6;    
 
     % g_phat is a complex-valued vector (function in freq domain)
     % where each value has amp of 1 and phase equal to phase diff between lm
