@@ -133,20 +133,35 @@ el_grid = deg2rad(-45:5:45);
 G_deg_pairs = [az_mesh(:), el_mesh(:)];
 G_spherical_vec = az_el_to_spherical_vec(G_deg_pairs(:, 1), G_deg_pairs(:, 2));
 
+% Pre-compute dla SRP-PHAT (opcjonalne, przyspiesza przy wielokrotnym użyciu)
+srp_precomp = srp_precompute(mic_positions_absolute, G_spherical_vec, ...
+    f_min, f_max, f_s, L, C);
+
 %% -- delay-and-sum --
 [das_az, das_el, das_info] = asl_das_doa_est(ura_rx_rev_noise_low, ...
                              mic_positions_absolute, G_deg_pairs, ...
                              G_spherical_vec, f_s);
+% Normalizacja kątów (opcjonalnie, jeśli chcesz sprawdzić poprawność)
+[das_az_norm, das_el_norm] = normalize_doa_angles(das_az, das_el, az, el);
+fprintf('DAS: Raw=(%.1f, %.1f), Normalized=(%.1f, %.1f), True=(%.1f, %.1f)\n', ...
+    das_az, das_el, das_az_norm, das_el_norm, az, el);
 
-%% -- SRP-PHAT -- << done, working
+%% -- SRP-PHAT -- << done, working, now optimized
 [srp_phat_az, srp_phat_el, srp_phat_info] = asl_srp_phat(ura_rx_rev_noise_low, ... 
-    mic_positions_absolute, f_min, f_max, f_s, G_deg_pairs, G_spherical_vec, C, L);
+    mic_positions_absolute, f_min, f_max, f_s, G_deg_pairs, G_spherical_vec, C, L, srp_precomp);
+[srp_phat_az_norm, srp_phat_el_norm] = normalize_doa_angles(srp_phat_az, srp_phat_el, az, el);
+fprintf('SRP-PHAT: Raw=(%.1f, %.1f), Normalized=(%.1f, %.1f), True=(%.1f, %.1f)\n', ...
+    srp_phat_az, srp_phat_el, srp_phat_az_norm, srp_phat_el_norm, az, el);
 
 %% -- MUSIC -- << done, almost working - angles conv to be checked
 lambda_0 = C/f_0;
 [music_az, music_el, music_info] = asl_music_2d(ura_rx_rev_noise_low, ...
     lambda_0, d, M_row_line, 1, G_deg_pairs);
+[music_az_norm, music_el_norm] = normalize_doa_angles(music_az, music_el, az, el);
+fprintf('MUSIC: Raw=(%.1f, %.1f), Normalized=(%.1f, %.1f), True=(%.1f, %.1f)\n', ...
+    music_az, music_el, music_az_norm, music_el_norm, az, el);
 
 %% -- MVDR --
 [mvdr_az, mvdr_el, mvdr_spec] = asl_mvdr_doa_est(ura_rx_rev_noise_low, ...
     mic_positions_absolute, G_deg_pairs, G_spherical_vec, f_s, lambda_0);
+fprintf('MVDR: (%.1f, %.1f), True=(%.1f, %.1f)\n', mvdr_az, mvdr_el, az, el);

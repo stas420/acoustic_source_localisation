@@ -78,16 +78,16 @@ typedef enum spi_mic_acq_enum_t {
 
 /* === constant globals === */
 
-// const coords_3D_t mics_positions[M] = {
-//     { 0,   0, 0 }, { 0,   0, d }, { 0,   0, 2*d }, { 0,   0, 3*d },
-//     { 0,   d, 0 }, { 0,   d, d }, { 0,   d, 2*d }, { 0,   d, 3*d },
-//     { 0, 2*d, 0 }, { 0, 2*d, d }, { 0, 2*d, 2*d }, { 0, 2*d, 3*d },
-//     { 0, 3*d, 0 }, { 0, 3*d, d }, { 0, 3*d, 2*d }, { 0, 3*d, 3*d }
-// }; //<< 192 B
+coords_3D_t mics_positions[M] = {
+  { 0, (-2.0f)*d, 2*d }, { 0, (-2.0f)*d, d }, {  0, (-2.0f)*d, (-1.0f)*d }, {  0, (-2.0f)*d, (-2.0f)*d },
+  { 0, (-1.0f)*d, 2*d }, { 0, (-1.0f)*d, d }, {  0, (-1.0f)*d, (-1.0f)*d }, {  0, (-1.0f)*d, (-2.0f)*d },
+  { 0,         d, 2*d }, { 0,         d, d }, {  0,         d, (-1.0f)*d }, {  0,         d, (-2.0f)*d },
+  { 0,  (2.0f)*d, 2*d }, { 0,  (2.0f)*d, d }, {  0,  (2.0f)*d, (-1.0f)*d }, {  0,  (2.0f)*d, (-2.0f)*d }
+};
 
 
 /* === non-constant globals === */
-coords_3D_t mics_positions[M];
+//coords_3D_t mics_positions[M];
 /**
  * @brief a look-up table storing every possible DoA as pair {az, el}
  */
@@ -156,38 +156,38 @@ static inline float rad2deg(float arg_rad) {
  * @brief this function prepares look-up tables: *all_possible_doas_lut* and *all_relative_tdoas_lut*
  */
 static void prepare_luts(void) {
-    {// prep mics
-        FILE *f = fopen("../mics.txt", "r");
-        if (!f) {
-            perror("plik z majkami nie dzialaaaa\n");
-            return;
-        }
+    // {// prep mics
+    //     FILE *f = fopen("../mics.txt", "r");
+    //     if (!f) {
+    //         perror("plik z majkami nie dzialaaaa\n");
+    //         return;
+    //     }
 
-        char line[2048];
-        int coord = 0;
+    //     char line[2048];
+    //     int coord = 0;
 
-        while (coord < 3 && fgets(line, sizeof(line), f)) {
-            char *ptr = line;
+    //     while (coord < 3 && fgets(line, sizeof(line), f)) {
+    //         char *ptr = line;
 
-            for (int mic = 0; mic < 16; mic++) {
-                if (coord == 0) {
-                    mics_positions[mic].x = strtof(ptr, &ptr);
-                }
-                else if (coord == 1) {
-                    mics_positions[mic].y = strtof(ptr, &ptr);
-                }
-                else {
-                    mics_positions[mic].z = strtof(ptr, &ptr);
-                }
+    //         for (int mic = 0; mic < 16; mic++) {
+    //             if (coord == 0) {
+    //                 mics_positions[mic].x = strtof(ptr, &ptr);
+    //             }
+    //             else if (coord == 1) {
+    //                 mics_positions[mic].y = strtof(ptr, &ptr);
+    //             }
+    //             else {
+    //                 mics_positions[mic].z = strtof(ptr, &ptr);
+    //             }
 
-                if (*ptr == ',') ptr++;
-            }
+    //             if (*ptr == ',') ptr++;
+    //         }
 
-            coord++;
-        }
+    //         coord++;
+    //     }
 
-        fclose(f);
-    }
+    //     fclose(f);
+    // }
 
     coords_3D_t sphere_vec;
     uint16_t doa_idx = 0;

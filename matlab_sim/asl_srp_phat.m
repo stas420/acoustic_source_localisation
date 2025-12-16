@@ -1,50 +1,62 @@
 function [az, el, info] = asl_srp_phat(rxSignal, micPos, fMin, fMax, ...
                                        samplingRate, gridAnglePairs, ...
-                                       gridSpherical, C, L)
-    %% --- TDoA matrix --- << this ood be considered precalc in other situations
-    % ---- for every d vector in D calculate TDoA per every possible mic pair
-    all_mic_pairs_idxs = nchoosek(1:size(micPos, 2), 2); % Generate all mic pair indices
-    n_pairs = size(all_mic_pairs_idxs, 1); % Number of mic pairs
-    n_dirs = size(gridSpherical, 2); % Number of direction vectors
-    taus = zeros(n_pairs, n_dirs);
+                                       gridSpherical, C, L, precomp)
+    % SRP-PHAT z opcjonalnymi pre-computacjami dla przyspieszenia
+    % 
+    % Inputs:
+    %   rxSignal - sygnały z mikrofonów [L x M]
+    %   micPos - pozycje mikrofonów [3 x M]
+    %   fMin, fMax - zakres częstotliwości [Hz]
+    %   samplingRate - częstotliwość próbkowania [Hz]
+    %   gridAnglePairs - siatka kątów [az, el] w radianach [G x 2]
+    %   gridSpherical - wektory kierunków [3 x G]
+    %   C - prędkość dźwięku [m/s]
+    %   L - długość ramki
+    %   precomp (opcjonalny) - struktura z pre-obliczonymi wartościami
+    %
+    % Outputs:
+    %   az, el - estymowane kąty [stopnie]
+    %   info - struktura z dodatkowymi informacjami
     
-    for p = 1:n_pairs
-        l = all_mic_pairs_idxs(p, 1);
-        m = all_mic_pairs_idxs(p, 2);
+    %% --- Pre-computacje lub ich użycie ---
+    if nargin < 10 || isempty(precomp)
+        % Oblicz TDoA matrix (jeśli nie podano pre-compute)
+        all_mic_pairs_idxs = nchoosek(1:size(micPos, 2), 2);
+        n_pairs = size(all_mic_pairs_idxs, 1);
+        n_dirs = size(gridSpherical, 2);
+        taus = zeros(n_pairs, n_dirs);
         
-        % difference of positions in cartesian coords
-        delta_v = micPos(:, m) - micPos(:, l);  % --> [3 x 1]
+        for p = 1:n_pairs
+            l = all_mic_pairs_idxs(p, 1);
+            m = all_mic_pairs_idxs(p, 2);
+            delta_v = micPos(:, m) - micPos(:, l);
+            taus(p, :) = (delta_v' * gridSpherical) / C;
+        end
         
-        % delta_v' * D = [1 x 3] * [3 x n_dirs] = [1 x n_dirs]
-        taus(p, :) = (delta_v' * gridSpherical) / C; % <-- this is from that weird formula considering direction angles only
+        % Freq bins setup
+        freqs = (0:L-1) * (samplingRate / L);
+        freq_mask = (freqs >= fMin) & (freqs <= fMax);
+        freq_indices = find(freq_mask);
+        F = freqs(freq_indices);
+    else
+        % Użyj pre-obliczonych wartości (szybsze!)
+        taus = precomp.taus;
+        all_mic_pairs_idxs = precomp.all_mic_pairs_idxs;
+        freq_indices = precomp.freq_indices;
+        F = precomp.F;
+        n_pairs = size(all_mic_pairs_idxs, 1);
+        n_dirs = size(gridSpherical, 2);
     end
     
-    %fprintf('TDoA matrix: [%d x %d]\n', n_pairs, n_dirs);
-
-    %% --- freq bins setup ---  << this too
-    % FFT's bins frequencies 
-    freqs = (0:L-1) * (samplingRate / L);  % [L x 1]
-    % and here we keep only the band of interest
-    freq_mask = (freqs >= fMin) & (freqs <= fMax);
-    freq_indices = find(freq_mask);
-
-    % fprintf("fft after setup, starting\n");
-
-    %% mic frames' DFT and initial filtering << and this also!
-    micFramesFFT = fft(rxSignal, [], 1);  % [L x M]    
-    micFramesFFT_filtered = micFramesFFT(freq_indices, :);  % [n_freqs x M]
-    F = freqs(freq_indices);
     n_freqs = length(F);
-    
-    %fprintf('FFT done: %d frequencies (%.0f - %.0f Hz)\n', ...
-    %        n_freqs, F(1), F(end));
 
-    %% --- GCC-PHAT computation ---    
-    % GGC-PHAT is a function of frequency per every mic pair considered
+    %% --- DFT i filtrowanie ---
+    micFramesFFT = fft(rxSignal, [], 1);  % [L x M]
+    micFramesFFT_filtered = micFramesFFT(freq_indices, :);  % [n_freqs x M]
+
+    %% --- GCC-PHAT dla wszystkich par ---
     gcc_phat_all = zeros(n_pairs, n_freqs);  % [n_pairs x n_freqs]
     
-    %fprintf('Computing GCC-PHAT for all pairs...\n');
-    tic
     for p = 1:n_pairs
         l = all_mic_pairs_idxs(p, 1);
         m = all_mic_pairs_idxs(p, 2);
@@ -55,51 +67,45 @@ function [az, el, info] = asl_srp_phat(rxSignal, micPos, fMin, fMax, ...
         gcc_phat_all(p, :) = asl_gcc_phat(X_l, X_m);  % [1 x n_freqs]
     end
 
-    %fprintf('GCC-PHAT computed for all pairs\n');
-
-    %% --- SRP map computation ---
-    % map is sum of GCCs across every mic pair and freq per every direction
+    %% --- SRP map - WEKTORYZACJA (zamiast 3 pętli tylko 1!) ---
+    % Stara wersja miała:
+    %   for u = 1:n_dirs
+    %       for p = 1:n_pairs
+    %           for f_idx = 1:n_freqs
+    % Nowa wersja:
+    %   for u = 1:n_dirs
+    %       [operacje macierzowe]
+    
     srp_map = zeros(n_dirs, 1);
     
-    %fprintf('Computing SRP map...\n');
-
-    % for every direction considered...
-    for u = 1:n_dirs            
-        srp_value = 0;
-        % ...and for every mic pair...
-        for p = 1:n_pairs
-            % ...for TDoA value determined by the specific mic pair and
-            % direction...
-            tau = taus(p, u);
-            
-            % ...and for each frequency bin considered...
-            for f_idx = 1:n_freqs
-                f = F(f_idx);
-                
-                % phase shift for this specific frequency and TDoA
-                phase_shift = exp(1j * 2 * pi * f * tau);
-                
-                % GCC-PHAT value for this particular pair and freq
-                g = gcc_phat_all(p, f_idx);
-                
-                % SRP-PHAT(u, f, xl, xm) = 
-                % Re[GCC-PHAT(f,xl,xm) * e^(j2pif * tau_lm(u))
-                contrib = real(g * phase_shift);
-                % and it's a sum!
-                srp_value = srp_value + contrib;
-            end
-        end
+    % Dla każdego kierunku oblicz SRP wartość
+    for u = 1:n_dirs
+        % Phase shifts dla wszystkich par i częstotliwości naraz
+        % taus(p, u) - opóźnienia dla kierunku u i pary p
+        % F to [n_freqs x 1] - częstotliwości
+        % Wynik: [n_pairs x 1] * [1 x n_freqs] = [n_pairs x n_freqs]
         
-        % normalisation per mics pair number - some say do, some say don't...
-        srp_map(u) = srp_value; %/n_pairs;
+        tau_u = taus(:, u);  % [n_pairs x 1]
+        tau_u = tau_u(:);    % zapewnij że to kolumna [n_pairs x 1]
+        F_row = F(:)';       % zapewnij że to wiersz [1 x n_freqs]
+        % Broadcasting: [n_pairs x 1] * [1 x n_freqs] = [n_pairs x n_freqs]
+        phase_shifts = exp(1j * 2 * pi * tau_u * F_row);  % [n_pairs x n_freqs]
+        
+        % Element-wise multiplication i suma
+        % gcc_phat_all: [n_pairs x n_freqs]
+        % phase_shifts: [n_pairs x n_freqs]
+        contrib = real(gcc_phat_all .* phase_shifts);  % [n_pairs x n_freqs]
+        
+        % Suma po wszystkich parach i częstotliwościach
+        srp_map(u) = sum(contrib(:));
     end
-    
-    %fprintf('SRP map computed\n');
 
-    %% --- find maximum in SRP map ---
+    %% --- Znajdź maksimum ---
     [~, max_idx] = max(srp_map);
-    info.time = toc;
-    %fprintf("SRP-PHAT is done\n");
     az = rad2deg(gridAnglePairs(max_idx, 1));
     el = rad2deg(gridAnglePairs(max_idx, 2));
+    
+    % Dodatkowe info
+    info.srp_map = srp_map;
+    info.max_idx = max_idx;
 end

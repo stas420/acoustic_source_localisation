@@ -18,32 +18,48 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-
+#include "test_data.h"
+#include "kiss_fftr.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "arm_math.h"
-#include "test_data.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
-//typedef struct coords_3D_t {
-//    float32_t x;
-//    float32_t y;
-//    float32_t z;
-//} coords_3D_t;
+typedef struct coords_3D_t {
+    float x;
+    float y;
+    float z;
+} coords_3D_t;
 
 typedef struct angle_pair_t {
-    float32_t az;
-    float32_t el;
+    float az;
+    float el;
 } angle_pair_t;
 
+/**
+ * @brief this struct holds TDoA between reference mic (0th idx) and assigned mic (mix_idx);
+ *        such implementation helps reducing memory cost of program
+ * 
+ * @param tau calculated relative TDoA
+ * @param mic_idx microphone index
+ * @param angle_pair_idx indicates for which DoA angles pair {az, el} indeex in *all_possible_doas_lut*
+ *                       this tau is relevant
+ */
 typedef struct tdoa_per_mic_per_doa_t {
-    float32_t tau;              // Changed to float for consistency
-    uint16_t angle_pair_idx;
+    float tau;
     uint8_t mic_idx;
+    uint16_t angle_pair_idx;
 } tdoa_per_mic_per_doa_t;
+
+/**
+ * @brief enumerator used to indicate whether data acquisition from SPI was successful or not
+ */
+typedef enum spi_mic_acq_enum_t {
+    MIC_ACQ_OK = 0,
+    MIC_ACQ_ERR = 1
+} spi_mic_acq_enum_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -51,38 +67,35 @@ typedef struct tdoa_per_mic_per_doa_t {
 #define M 16                    /* num of mics */
 #define Ny 4                    /* num of mics in y column */
 #define Nz 4                    /* num of mics in z row */
-#define C 343.0f                /* speed of sound in m/s */
-#define d 0.042f                /* spacing between mics */
-#define F_MIN 300.0f            /* minimum freq considered in Hz */
-#define F_MAX 3000.0f           /* maximum freq considered in Hz */
-#define F_S 16000.0f            /* incoming signal sampling rate */
-#define L 512                   /* x_m microphone's signal frame length */
-#define R 10                    /* angular grid resolution in degrees */
-#define AZ_LOW -90              /* min azimuth angle considered in degrees */
-#define AZ_HIGH 90              /* max azimuth angle considered in degrees */
-#define EL_LOW -90              /* min elevation angle considered in degrees */
-#define EL_HIGH 90              /* max elevation angle considered in degrees */
+#define C 343                   /* speed of sound in m/s */
+#define d 0.042                 /* spacing between mics */
+#define F_MIN 300               /* minimum freq considered in Hz */
+#define F_MAX 3000              /* minimum freq considered in Hz */
+#define F_S 16000               /* incoming signal sampling rate */
+#define L 1024                   /* x_m microphone's signal frame length - TO BE DETERMINED */
+#define R 10                    /* angualar grid resolution in degrees */
+#define AZ_LOW -90              /* min azimuth angle conidered in degrees */
+#define AZ_HIGH 90              /* max azimuth angle conidered in degrees */
+#define EL_LOW -45              /* min elevation angle considered in degrees */
+#define EL_HIGH 45              /* max elevation angle considered in degrees */
+#define PI 3.141592653589793238 /* pi approximation */
+#define EPS 0.000000001           /* epsilon value for numerical stability */
 
-#ifndef PI
-    #define PI 3.141592653589793f /* pi approximation */
-#endif
-
-#define EPS 1e-10f              /* epsilon value for numerical stability */
-
-#define F_NYQ (F_S / 2.0f)                                  /* Nyquist frequency */
-#define REAL_FFT_LEN ((L/2) + 1)
+#define F_NYQ (F_S / 2)                                     /* Nyquist frequency */
+#define REAL_FFT_LEN ((L/2) + 1)                            /* length of the output of real-valued signal's FFT, which is of use */
 #define ALL_AZIMUTHS ((AZ_HIGH - AZ_LOW)/R + 1)             /* size of azimuth grid */
 #define ALL_ELEVATIONS ((EL_HIGH - EL_LOW)/R + 1)           /* size of elevation grid */
-#define ALL_POSSIBLE_DOAS (ALL_AZIMUTHS * ALL_ELEVATIONS)   /* size of all DoAs grid */
+#define ALL_POSSIBLE_DOAS (ALL_AZIMUTHS * ALL_ELEVATIONS)   /* size of all DoAs grid (i.e. every possible pair of {az,el}) */
 
-#define SAMPLE_SIZE_BYTES 4U
-
-/* Scaling factor for CIC filter output (PDM to PCM conversion)
- * CIC filters typically have gain = (R*M)^N where R=decimation, M=differential delay, N=stages
- * Adjust this based on your actual CIC configuration to prevent clipping
- * Typical range: 1.0f (no scaling) to 1e-6f (heavy decimation)
- */
-#define CIC_SCALE_FACTOR (1.0f / ((float) (1 << 23)))  /* TODO - possible change here, needs research */
+#define CIC_GAIN_F ((float) (1ULL << 30))  /* CIC has its internal gain like (RM)^N, we have (64*1)^5 = 2^30 */
+/*
+  CIC params: stages 5, diff delay 1, dec ratio 64
+  TODO:
+  - add windowing b4 fft
+  - remove DC??? depends if it's zero-mean
+  - add scaling down -- quantization mode: full precision
+  - 
+*/
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -96,45 +109,64 @@ SPI_HandleTypeDef hspi1;
 DMA_HandleTypeDef handle_GPDMA1_Channel0;
 
 /* USER CODE BEGIN PV */
-//const coords_3D_t mics_positions[M] = {
-//    {0.0f, -1.5f * d, -1.5f * d},
-//    {0.0f, -0.5f * d, -1.5f * d},
-//    {0.0f,  0.5f * d, -1.5f * d},
-//    {0.0f,  1.5f * d, -1.5f * d},
-//
-//    {0.0f, -1.5f * d, -0.5f * d},
-//    {0.0f, -0.5f * d, -0.5f * d},
-//    {0.0f,  0.5f * d, -0.5f * d},
-//    {0.0f,  1.5f * d, -0.5f * d},
-//
-//    {0.0f, -1.5f * d,  0.5f * d},
-//    {0.0f, -0.5f * d,  0.5f * d},
-//    {0.0f,  0.5f * d,  0.5f * d},
-//    {0.0f,  1.5f * d,  0.5f * d},
-//
-//    {0.0f, -1.5f * d,  1.5f * d},
-//    {0.0f, -0.5f * d,  1.5f * d},
-//    {0.0f,  0.5f * d,  1.5f * d},
-//    {0.0f,  1.5f * d,  1.5f * d}
-//};
-
+/**
+ * @brief simple enum for SPI status indications
+ */
 enum { SPI_CPLT, SPI_BUSY } spi_status;
 
-static angle_pair_t all_possible_doas_lut[ALL_POSSIBLE_DOAS];
-static tdoa_per_mic_per_doa_t all_relative_tdoas_lut[ALL_POSSIBLE_DOAS * M];
+coords_3D_t mics_positions[M] = {
+  { 0, (-2.0f)*d, 2*d }, { 0, (-2.0f)*d, d }, {  0, (-2.0f)*d, (-1.0f)*d }, {  0, (-2.0f)*d, (-2.0f)*d },
+  { 0, (-1.0f)*d, 2*d }, { 0, (-1.0f)*d, d }, {  0, (-1.0f)*d, (-1.0f)*d }, {  0, (-1.0f)*d, (-2.0f)*d },
+  { 0,         d, 2*d }, { 0,         d, d }, {  0,         d, (-1.0f)*d }, {  0,         d, (-2.0f)*d },
+  { 0,  (2.0f)*d, 2*d }, { 0,  (2.0f)*d, d }, {  0,  (2.0f)*d, (-1.0f)*d }, {  0,  (2.0f)*d, (-2.0f)*d }
+};
+/**
+ * @brief a look-up table storing every possible DoA as pair {az, el}
+ */
+static angle_pair_t all_possible_doas_lut[ALL_POSSIBLE_DOAS]; //<< 2,888 B
+/**
+ * @brief a look-up table storing every mic's relative TDoA for every possible DoA
+ *        in relation to 0th microphone - this way we save memory in trade for slightly 
+ *        more calculations in the run-time
+ */
+static tdoa_per_mic_per_doa_t all_relative_tdoas_lut[ALL_POSSIBLE_DOAS * M]; //<< 46,208 B with padding, 40,432 B optimized
 
-static uint16_t low_fft_bin_idx = 0;
-static uint16_t high_fft_bin_idx = 0;
-static float32_t fft_bins_lut[REAL_FFT_LEN] __attribute__((aligned(4)));
+/**
+ * @brief a look-up table storing every frequency bin of interest
+ */
+static float fft_bins_lut[REAL_FFT_LEN];//<< 2,052 B
+/**
+ * @brief indicators of minimum and maximum bins of FFT for freqs of interest
+ */
+static uint16_t fft_bin_low = 0, fft_bin_high = 0;//<< 2 * 2 B = 4 B
 
-static int32_t spi_mic_data_buff[M * L] __attribute__((aligned(4)));
-//static float32_t float_mic_data_buff[M][L] __attribute__((aligned(4)));
-static float32_t float_mic_data_fft_buff[M][L] __attribute__((aligned(4)));
-static float32_t hann_window[L] __attribute__((aligned(4)));
+/**
+ * @brief kiss_fft library config field, used to run FFT - this is a real-input FFT, outputs cpx
+ */
+kiss_fftr_cfg kissfftrcfg = NULL; //<< this is a ptr, idk how much it allocs
 
-static float32_t srp_phat_map[ALL_POSSIBLE_DOAS] __attribute__((aligned(4)));
+/**
+ * @brief buffer for incoming mic data from SPI
+ */
+uint32_t spi_data_buff[M * L] = { 0U };
+#ifndef TEST_DATA_H
+/**
+ * @brief preallocated buffer for incoming real signal data from mics (thru SPI)
+ */
+float mic_data_buff[M][L] = { 0 };//<<  65,536 B
+#endif
 
-static arm_rfft_fast_instance_f32 rfft_f32;
+/**
+ * @brief preallocated buffer for incoming real signal data FFT 
+ */
+static kiss_fft_cpx mic_data_fft_buff[M][REAL_FFT_LEN]; //<< 65,664 B
+
+/**
+ * @brief preallocated buffer for SRP-PHAT map (as function of DoA angles pair)
+ * 
+ */
+static float srp_phat_map_per_doa[ALL_POSSIBLE_DOAS];//<< 1,444 B
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -148,268 +180,272 @@ static void MX_SPI1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi) {
-	spi_status = SPI_CPLT;
-}
-
-
 /**
- * @brief Convert degrees to radians
+ * @brief helper function for data buffer conversion process (SPI(CIC): uint32_t -> kissfft: float32_t)
+ * 
  */
-static inline float32_t deg2rad(float32_t arg_deg) {
-    return (float32_t)(arg_deg * (PI / 180.0f));
+void convert_buffer(void) {
+    static int32_t tmp_24bit = 0;
+    
+    for (uint32_t l = 0U; l < L; l++) {
+        for (uint32_t m = 0U; m < M; m++) {
+            // spi_data_buff[m + M * l] <--> mic_data_buff[m][l]
+            /* get rid of the last 8-bit marker */
+            tmp_24bit = (int32_t) (spi_data_buff[m + M * l] >> 8);
+            
+            /* extend the sign of CIC sample */
+            if (tmp_24bit & 0x00800000) {
+                tmp_24bit |= 0xFF000000;
+            }
+            
+            /* compensate the CIC gain - from vivado it seems to be not done internally */
+            mic_data_buff[m][l] = ((float) tmp_24bit) / CIC_GAIN_F;
+        }
+    }
 }
 
 /**
- * @brief Convert radians to degrees
+ * @brief basic impl of conversion from degrees to radians
+ * 
+ * @param arg_deg argument in degrees 
+ * @return float argument converted to radians
  */
-static inline float32_t rad2deg(float32_t arg_rad) {
-    return (float32_t)(arg_rad * (180.0f / PI));
+static inline float deg2rad(float arg_deg) {
+    return (arg_deg * (float)(PI / 180.0f));
 }
 
 /**
- * @brief Prepare lookup tables for DoA grid and TDoA values
- * @note Called once during initialization
+ * @brief basic impl of conversion from radians to degrees
+ * 
+ * @param arg_rad argument in radians
+ * @return float argument converted to degrees
+ */
+static inline float rad2deg(float arg_rad) {
+    return (arg_rad * (float)(180.0f / PI));
+}
+
+/**
+ * @brief this function prepares look-up tables: *all_possible_doas_lut* and *all_relative_tdoas_lut*
  */
 static void prepare_luts(void) {
     coords_3D_t sphere_vec;
-    uint16_t doa_idx = 0U;
-    uint32_t tdoa_idx = 0U;
-    uint8_t mic_idx = 0U;
-    float32_t az_rad, el_rad;
-    float32_t tmp_tau;
+    uint16_t doa_idx = 0;
+    uint32_t tdoa_idx = 0;
+    uint16_t el_idx = 0;
+    uint8_t mic_idx = 0;
+    float az_rad = 0.0f;
+    float el_rad = 0.0f;
 
-    /* prep Hann window */
-    for (uint16_t i = 0; i < L; i++) {
-        hann_window[i] = 0.5f * (1.0f - cosf(2.0f * PI * (float32_t)i / (float32_t)(L - 1)));
-    }
-
-    /* prep DoA grid and TDoA for each mic pair */
+    /* for every azimuth degree step */
     for (uint16_t az_idx = 0; az_idx < ALL_AZIMUTHS; az_idx++) {
-        for (uint16_t el_idx = 0; el_idx < ALL_ELEVATIONS; el_idx++) {
-            /* DoA in degrees */
-            all_possible_doas_lut[doa_idx].az = (float32_t)(AZ_LOW + (az_idx * R));
-            all_possible_doas_lut[doa_idx].el = (float32_t)(EL_LOW + (el_idx * R));
-
+        /* and for every elevation degree step */
+        for (el_idx = 0; el_idx < ALL_ELEVATIONS; el_idx++) {
+            /* define an entry in degree-grid */
+            all_possible_doas_lut[doa_idx].az = (float) (AZ_LOW + (az_idx * R));
+            all_possible_doas_lut[doa_idx].el = (float) (EL_LOW + (el_idx * R));
+            
+            /* Convert to radians ONCE for this DoA */
             az_rad = deg2rad(all_possible_doas_lut[doa_idx].az);
             el_rad = deg2rad(all_possible_doas_lut[doa_idx].el);
-
-            /* the reference mic is of 0th index, it has TDoA = 0 */
+            
+            /* 0th element is our ref, so it's zero all the time */
             all_relative_tdoas_lut[tdoa_idx].angle_pair_idx = doa_idx;
-            all_relative_tdoas_lut[tdoa_idx].mic_idx = 0U;
-            all_relative_tdoas_lut[tdoa_idx].tau = 0.0f;
+            all_relative_tdoas_lut[tdoa_idx].mic_idx = (uint8_t) 0;
+            all_relative_tdoas_lut[tdoa_idx].tau = (float) 0;
             tdoa_idx++;
 
-            /* prep spherical direction vector as per MATLAB convention:
-             * sphere_vec.x = cos(el) * cos(az)
-             * sphere_vec.y = cos(el) * sin(az)
-             * sphere_vec.z = sin(el)
-             *
-             * they say cosf/sinf are slower than arm_cos_f32/sin
-             * but this is our LUT, we need accuracy for once, right?
+            /* Calculate spherical direction vector according to MATLAB convention:
+             * d_hat(1) = cos(theta) * cos(phi)   where theta=elevation, phi=azimuth
+             * d_hat(2) = cos(theta) * sin(phi)
+             * d_hat(3) = sin(theta)
              */
             sphere_vec.x = cosf(el_rad) * cosf(az_rad);
             sphere_vec.y = cosf(el_rad) * sinf(az_rad);
             sphere_vec.z = sinf(el_rad);
 
-            /* Compute relative TDoA for each mic relative to mic 0 */
+            /* every other mic's relative TDoA is calculated relatively to 0th mic */
             for (mic_idx = 1; mic_idx < M; mic_idx++) {
                 all_relative_tdoas_lut[tdoa_idx].angle_pair_idx = doa_idx;
                 all_relative_tdoas_lut[tdoa_idx].mic_idx = mic_idx;
-
-                /* TDoA = (direction_vector · position_difference) / speed_of_sound */
-                tmp_tau = (sphere_vec.x * (mics_positions[mic_idx].x - mics_positions[0].x) +
-                          sphere_vec.y * (mics_positions[mic_idx].y - mics_positions[0].y) +
-                          sphere_vec.z * (mics_positions[mic_idx].z - mics_positions[0].z)) / C;
-
-                all_relative_tdoas_lut[tdoa_idx].tau = tmp_tau;
+                all_relative_tdoas_lut[tdoa_idx].tau = (float) (
+                    (sphere_vec.x * (mics_positions[mic_idx].x - mics_positions[0].x)) 
+                  + (sphere_vec.y * (mics_positions[mic_idx].y - mics_positions[0].y))
+                  + (sphere_vec.z * (mics_positions[mic_idx].z - mics_positions[0].z))
+                ) / ((float) C);
                 tdoa_idx++;
             }
-
+            
             doa_idx++;
         }
     }
+    
+    /* prepare every FFT bin and indicators */
+    fft_bin_low = 0;
+    fft_bin_high = 0;
+    
+    for (uint16_t k = 0; k < REAL_FFT_LEN; k++) {
+        fft_bins_lut[k] = k * ((float)F_S / (float)L);
 
-    /*
-     * TODO - check if omega pre calc is good
-     */
-    /* Prepare FFT bin frequencies and determine frequency range of interest */
-    low_fft_bin_idx = (uint16_t)ceilf(F_MIN * (float32_t)L / F_S);
-    high_fft_bin_idx = (uint16_t)floorf(F_MAX * (float32_t)L / F_S) + 1U;
+        // Count bins below F_MIN
+        if (fft_bins_lut[k] < F_MIN) {
+            fft_bin_low++;
+        }
 
-    for (uint16_t k = 0U; k < (uint16_t) REAL_FFT_LEN; k++) {
-        fft_bins_lut[k] = k * (F_S / (float32_t)L);
+        // Count bins up to AND including F_MAX
+        if (fft_bins_lut[k] <= F_MAX) {
+            fft_bin_high = k + 1;  // Set to NEXT index (for < comparison in loop)
+        }
+    }
+    
+    // Debug output
+    // printf("FFT bins: low=%d (%.1f Hz), high=%d (%.1f Hz)\n", 
+    //        fft_bin_low, fft_bins_lut[fft_bin_low],
+    //        fft_bin_high-1, fft_bins_lut[fft_bin_high-1]);
+}
+
+
+/**
+ * @brief helper function to run FFT for real-valued signals acquired from mics
+ * 
+ */
+static void run_rfft(void) {
+    for (uint8_t m = 0; m < M; m++) {
+        kiss_fftr(kissfftrcfg, &mic_data_buff[m][0], &mic_data_fft_buff[m][0]);
     }
 }
 
 /**
- * @brief Convert SPI buffer (int32_t CIC output) to float32_t format
- * @note CIC filter output is typically in Q31 format (32-bit signed integer)
- *       We convert to float [-1.0, 1.0] for FPU-optimized processing
+ * @brief absolute value of complex number in kiss_fft_cpx convention
+ * 
+ * @param c complex to compute abs from
+ * @return kiss_fft_scalar real-valued abs(c)
  */
-//static void convert_buffer(void) {
-//    union {
-//        uint8_t u8[4];
-//        int32_t i32;
-//    } conv;
-//
-//    uint32_t mic_frame_i = 0U;
-//    uint32_t spi_i = 0U;
-//
-//    /* incoming SPI data format is as follows:
-//     * [mic0_sample0, mic1_sample0, ..., mic15_sample0, mic0_sample1, ...]
-//     * each sample is 4 bytes - a 32-bit signed integer from CIC filter
-//     */
-//    while (spi_i < SPI_DATA_BUFF_LEN) {
-//        for (uint32_t mic_i = 0U; mic_i < M; mic_i++) {
-//        	/* MSB data format? */
-//            conv.u8[3] = spi_mic_data_buff[spi_i];
-//            spi_i++;
-//            conv.u8[2] = spi_mic_data_buff[spi_i];
-//            spi_i++;
-//            conv.u8[1] = spi_mic_data_buff[spi_i];
-//            spi_i++;
-//            conv.u8[0] = spi_mic_data_buff[spi_i];
-//            spi_i++;
-//
-//            float_mic_data_buff[mic_i][mic_frame_i] = ((float)conv.i32) * CIC_SCALE_FACTOR;
-//        }
-//        mic_frame_i++;
-//    }
-//}
+static kiss_fft_scalar cpx_abs(const kiss_fft_cpx c) {
+    return sqrtf((c.r * c.r) + (c.i * c.i));
+} 
 
 /**
- * @brief get complex FFT bin (Re, Im) from arm_rfft_fast_f32 output
- * @param fft_buff Pointer to FFT output buffer
- * @param k Bin index (0 to L/2)
- * @param out_re_im Output array [Re, Im]
- *
- * @note arm_rfft_fast_f32 output format for L=512:
- *       { Re[0], Im[0], Re[1], Im[1], ... Re[L], Im[L] }
- *       DC (k=0) and Nyquist (k=256) have no imaginary part
+ * @brief complex conjugation in kiss_fft_cpx convention
+ * 
+ * @param c complex to compute conj from
+ * @return kiss_fft_cpx complex-valued conj(c)
  */
-static void get_fft_bin(const float32_t* fft_buff, uint16_t k, float32_t* out_re_im) {
-    if (k == 0) {
-        out_re_im[0] = fft_buff[0];
-        out_re_im[1] = fft_buff[1];  // Im[0] is typically 0 but stored at index 1
-    } else if (k == (L / 2)) {
-        out_re_im[0] = fft_buff[L];  // Re[N/2] is at index L (not L/2!)
-        out_re_im[1] = 0.0f;
-    } else {
-        out_re_im[0] = fft_buff[2 * k];      // Re[k]
-        out_re_im[1] = fft_buff[2 * k + 1];  // Im[k]
-    }
+static kiss_fft_cpx cpx_conj(const kiss_fft_cpx c) {
+    kiss_fft_cpx ret = {
+        .r = (kiss_fft_scalar) c.r,
+        .i = (kiss_fft_scalar)((-1) * c.i)
+    };
+    return ret;
+} 
+
+/**
+ * @brief complex multiplication of two complex numbers in kiss_fft_cpx convention
+ * 
+ * @param a first complex
+ * @param b second complex
+ * @return kiss_fft_cpx complex-valued result of a*b = (a.r + a.i) * (b.r + b.i) = ...
+ */
+static kiss_fft_cpx cpx_mult(const kiss_fft_cpx a, const kiss_fft_cpx b) {
+    kiss_fft_cpx ret = {
+        .r = (kiss_fft_scalar) ((a.r * b.r) - (a.i * b.i)),
+        .i = (kiss_fft_scalar) ((a.r * b.i) + (a.i * b.r))
+    };
+    return ret;
 }
-// fk = k * F_S/L
-// k = fk  * L /F_S
+
 /**
- * @brief the core SRP-PHAT algorithm for DoA estimation
- * @return estimated DoA as pair of angles { azimuth, elevation }
+ * @brief implements the proper SRP-PHAT algorithm search and fills srp_phat_map_per_doa array 
+ *        with computed values - after this call, the array maximum's index is the same
+ *        as estimated DoA's in all_possible_doas_lut array
  */
-static angle_pair_t srp_phat(void) {
-    angle_pair_t ret_doa;
-    uint32_t doa_idx = 0U;
-    uint32_t max_doa_idx = 0U;
-
-    /* -- 1. RFFT for all microphones' data -- */
-    for (uint8_t m = 0U; m < M; m++) {
-    	/* but also window the signal, for better data */
-    	arm_mult_f32(&float_mic_data_buff[m][0], hann_window, &float_mic_data_buff[m][0], (uint32_t) L);
-        arm_rfft_fast_f32(&rfft_f32, &float_mic_data_buff[m][0], &float_mic_data_fft_buff[m][0], 0U);
+void srp_phat(void) {
+    kiss_fft_cpx gcc_phat_sum;
+    kiss_fft_cpx tmp_cross_spec;
+    float tmp_cross_spec_abs = 0;
+    float tmp_theta = 0;
+    float cos_theta = 0;
+    float sin_theta = 0;
+    float tau_ml = 0;
+    uint16_t doa_idx = 0;
+    uint32_t doa_base_idx = 0;
+    
+    // Initialize map
+    for (uint16_t i = 0; i < ALL_POSSIBLE_DOAS; i++) {
+        srp_phat_map_per_doa[i] = 0.0f;
     }
-
-    /* -- 2. SRP-PHAT map init -- */
-    arm_fill_f32(0.0f, srp_phat_map, (uint32_t) ALL_POSSIBLE_DOAS);
-
-    /* -- 3. calc  SRP-PHAT for each DoA -- */
-    float32_t bin_m[2], bin_l[2];
-    float32_t cross_spec[2];
-    float32_t cross_spec_mag;
-    float32_t gcc_phat_sum[2];
-    float32_t tau_ml, phase, omega;
-    float32_t cos_phase, sin_phase;
-    float32_t steered_re, steered_im;
-
-    /* for each doa considered... */
-    for (uint32_t doa = 0U; doa < ALL_POSSIBLE_DOAS; doa++) {
-        doa_idx = doa * M;
-
-        /* ...and for each mic pair... */
-        for (uint8_t mic_m = 0U; mic_m < M; mic_m++) {
-            for (uint8_t mic_l = mic_m + 1U; mic_l < M; mic_l++) {
-
-                /* prep GCC-PHAT func */
-                gcc_phat_sum[0] = 0.0f;
-                gcc_phat_sum[1] = 0.0f;
-
-                /* ...and for each FFT bin of interest */
-                for (uint16_t k = low_fft_bin_idx; k < high_fft_bin_idx; k++) {
-
-                    /* get correct FFT bins for both mics */
-                    get_fft_bin(float_mic_data_fft_buff[mic_m], k, bin_m);
-                    get_fft_bin(float_mic_data_fft_buff[mic_l], k, bin_l);
-
-                    /* computing GCC-PHAT cross-spectrum (nominator) */
-                    cross_spec[0] = bin_l[0] * bin_m[0] + bin_l[1] * bin_m[1];
-                    cross_spec[1] = bin_l[1] * bin_m[0] - bin_l[0] * bin_m[1];
-
-                    /* magnitude for PHAT normalization - this or that? */
-                    //(void) arm_sqrt_f32(cross_spec[0] * cross_spec[0] + cross_spec[1] * cross_spec[1],
-                    //					&cross_spec_mag);
-                    arm_cmplx_mag_f32(cross_spec, &cross_spec_mag, (uint32_t) 1U);
-
-                    /* skip if cross spectrum's magnitude is close to 0, leave it that way */
-                    if (cross_spec_mag > EPS) {
-
-                        /* apply PHAT normalization */
-                        cross_spec[0] /= cross_spec_mag;
-                        cross_spec[1] /= cross_spec_mag;
-
-                        /* calc TDoA for this mic pair and DoA */
-                        tau_ml =   all_relative_tdoas_lut[doa_idx + mic_l].tau
-                        		 - all_relative_tdoas_lut[doa_idx + mic_m].tau;
-
-                        /* prep phase shift */
-                        omega = 2.0f * PI * fft_bins_lut[k];
-                        phase = fmodf(omega * tau_ml, 2.0f * PI);
-
-                        if (phase > PI) {
-                        	phase -= 2.0f * PI;
-                        }
-
-                        if (phase < -PI) {
-                        	phase += 2.0f * PI;
-                        }
-
-                        /* prep steering vec: e^(j*phase) = cos(phase) + j*sin(phase) */
-                        cos_phase = arm_cos_f32(phase);
-                        sin_phase = arm_sin_f32(phase);
-
-                        /* apply steering vec */
-                        steered_re = cross_spec[0] * cos_phase - cross_spec[1] * sin_phase;
-                        steered_im = cross_spec[0] * sin_phase + cross_spec[1] * cos_phase;
-
-                        /* add to this GCC-PHAT function */
-                        gcc_phat_sum[0] += steered_re;
-                        gcc_phat_sum[1] += steered_im;
+    
+    /* For each DoA... */
+    for (uint16_t doa = 0; doa < ALL_POSSIBLE_DOAS; doa++) {
+        // Calculate base index for this DoA in the TDoA LUT
+        doa_base_idx = (uint32_t)doa * (uint32_t)M;
+        
+        /* For each unique microphone pair (m, l) where l > m */
+        for (uint8_t mic_m = 0; mic_m < M; mic_m++) {
+            for (uint8_t mic_l = mic_m + 1; mic_l < M; mic_l++) {
+                
+                gcc_phat_sum.r = 0.0f;
+                gcc_phat_sum.i = 0.0f;
+                
+                /* TDoA for this particular pair and DoA */
+                tau_ml = all_relative_tdoas_lut[doa_base_idx + mic_l].tau 
+                       - all_relative_tdoas_lut[doa_base_idx + mic_m].tau;
+                
+                /* For each frequency bin in [F_MIN, F_MAX] */
+                for (uint16_t k = fft_bin_low; k < fft_bin_high; k++) {
+                    // Cross-spectrum
+                    tmp_cross_spec = cpx_mult(mic_data_fft_buff[mic_l][k], 
+                                              cpx_conj(mic_data_fft_buff[mic_m][k]));
+                    tmp_cross_spec_abs = cpx_abs(tmp_cross_spec);
+                    
+                    /* Enter if magnitude is non-zero */
+                    if (tmp_cross_spec_abs > EPS) {
+                        /* GCC-PHAT: normalize by magnitude */
+                        tmp_cross_spec.r /= tmp_cross_spec_abs;
+                        tmp_cross_spec.i /= tmp_cross_spec_abs;
+                        
+                        /* Steering vector: e^(j * 2 * pi * f * tau) */
+                        tmp_theta = 2.0f * (float)PI * fft_bins_lut[k] * tau_ml;
+                        cos_theta = cosf(tmp_theta);
+                        sin_theta = sinf(tmp_theta);
+                        
+                        /* Multiply GCC-PHAT with steering vector */
+                        gcc_phat_sum.r += tmp_cross_spec.r * cos_theta - tmp_cross_spec.i * sin_theta;
+                        gcc_phat_sum.i += tmp_cross_spec.r * sin_theta + tmp_cross_spec.i * cos_theta;
                     }
                 }
-
-                /* add its power to SRP-PHAT map */
-                srp_phat_map[doa] +=   gcc_phat_sum[0] * gcc_phat_sum[0]
-									 + gcc_phat_sum[1] * gcc_phat_sum[1];
+                
+                /* Add power to SRP map for this DoA */
+                srp_phat_map_per_doa[doa] += (gcc_phat_sum.r * gcc_phat_sum.r) 
+                                            + (gcc_phat_sum.i * gcc_phat_sum.i);
             }
         }
     }
-
-    /* -- 4. find maximum in SRP-PHAT map and return it -- */
-    float32_t max_power;
-    arm_max_f32(srp_phat_map, ALL_POSSIBLE_DOAS, &max_power, &max_doa_idx);
-    ret_doa = all_possible_doas_lut[max_doa_idx];
-
-    return ret_doa;
 }
 
+/**
+ * @brief this func returns index of the found maximum in already-computed SRP-PHAT map
+ * 
+ * @return uint32_t index of the found maximum
+ */
+uint32_t find_max_doa_idx(void) {
+    uint32_t ret = 0;
+    for (uint32_t i = 0; i < ALL_POSSIBLE_DOAS; i++) {
+        if (srp_phat_map_per_doa[i] > srp_phat_map_per_doa[ret]) {
+            ret = i;
+        }
+    }
+
+    return ret;
+}
+
+/**
+ * @brief custom handler for full buffer DMA event
+ * 
+ * @param hspi SPI handler
+ */
+void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi) {
+	  spi_status = SPI_CPLT;
+}
 /* USER CODE END 0 */
 
 /**
@@ -436,20 +472,13 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-  spi_status = SPI_CPLT;
   prepare_luts();
-  arm_status arm_stat;
-
-  #if L == 512
-    arm_stat = arm_rfft_fast_init_512_f32(&rfft_f32);
+  #ifndef TEST_DATA_H
+  	  spi_status = SPI_BUSY;
   #else
-	arm_stat = arm_rfft_fast_init_f32(&rfft_f32, (uint16_t) L);
+  	  spi_status = SPI_CPLT;
   #endif
 
-  /* well, if RFFT doesn't work, we don't have anything to play with */
-  if (arm_stat != ARM_MATH_SUCCESS) {
-	  Error_Handler();
-  }
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -457,29 +486,38 @@ int main(void)
   MX_GPDMA1_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
-  const uint32_t spi_timeout = 100U;
-  HAL_StatusTypeDef status = HAL_OK;
-  angle_pair_t doa;
+  kissfftrcfg = kiss_fftr_alloc(L, 0, NULL, NULL);
 
-  //(void) HAL_SPI_Receive_DMA(&hspi1, (uint8_t*) spi_mic_data_buff, (uint16_t) SPI_DATA_BUFF_LEN);
+  if (kissfftrcfg == NULL) {
+	  HardFault_Handler();
+  }
+
+  #ifndef TEST_DATA_H
+    HAL_SPI_Receive_DMA(&hspi1, (uint8_t*) spi_data_buff, (uint16_t) (M * L * sizeof(uint32_t)));
+  #endif
+
+  uint32_t doa_idx = 0U;
+  angle_pair_t doa_est;
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	if (spi_status == SPI_CPLT) {
-		spi_status = SPI_BUSY;
-		//convert_buffer();
-		//doa = srp_phat();
-		arm_rfft_fast_f32(&rfft_f32, &float_mic_data_buff[0][0], &float_mic_data_fft_buff[0][0], 0U);
-		//(void) HAL_SPI_Receive_DMA(&hspi1, (uint8_t*) spi_mic_data_buff, (uint16_t) SPI_DATA_BUFF_LEN);
-		/* TODO: send DoA thru UART! */
-	}
-	else {
+      if (spi_status == SPI_CPLT) {
+		  #ifndef TEST_DATA_H
+             convert_buffer();
+          #endif
+          run_rfft();
+          srp_phat();
+          doa_idx = find_max_doa_idx();
+          doa_est = all_possible_doas_lut[doa_idx];
 
-	}
-	status = HAL_ERROR;
+		  #ifndef TEST_DATA_H
+              spi_status = SPI_BUSY;
+              HAL_SPI_Receive_DMA(&hspi1, (uint8_t*) spi_data_buff, (uint16_t) (M * L * sizeof(uint32_t)));
+		  #endif
+      }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
