@@ -37,7 +37,11 @@ On Linux you'd probably want to do it the same way, but run `cmake` as usual and
 
 # stm_code
 
-In this directory, an STM32CubeIDE project is held. This is a complete code for STM32 H563ZI (ARM Cortex M33) for data acquisition from 16 mics from dedicated FPGA through SPI, and for DoA calculations based on that. It uses **[CMSIS-DSP](https://github.com/ARM-software/CMSIS-DSP)** precompiled library for maths and Q31 arithmetics, which is included in `/Drivers/CMSIS/DSP`. 
+In this directory, an STM32CubeIDE project is held. This is a complete code for STM32 H563ZI (ARM Cortex M33) for data acquisition from 16 mics from dedicated FPGA through SPI, and for DoA calculations based on that. ~~It uses **[CMSIS-DSP](https://github.com/ARM-software/CMSIS-DSP)** precompiled library for maths and Q31 arithmetics, which is included in `/Drivers/CMSIS/DSP`.~~ It uses kissfft, same as the above PoC implementation. The results computed for test data on the device are the same for both PoC and STM version. 
+
+Device's SRAM usage: ~20%
+Device's flash mem usage: ~2%
+Time needed for `srp_phat()`: from ~20s for -90:90 grids, R=10 and 1024 frame, to ~5s for -75:75 and -45:45 grid, R=15, 512 frame 
 
 *It, then, will transmit estimated DoA angles through UART to connected PC with dedicated Python script.* <-- TODO
 
