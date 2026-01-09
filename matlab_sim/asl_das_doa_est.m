@@ -1,64 +1,54 @@
-function [az, el, info] = asl_das_doa_est(rxSignal, micsPositions, ...
-                            gridAnglePairs, gridDirVectors, fs)
-    % POPRAWIONA WERSJA - naprawiono obliczenia tau
+function [az, el, info] = asl_das_doa_est(rxSignal, gridAnglePairs, ...
+                                          fs, taus)
+    %% -- info
+    % Delay-and-Sum beamforming used for DoA estimation is simply
+    % just grid search by applying proper time delays per direction
+    % and mic. In time domain, it is quite tough, due to interpolation
+    % operations needed. Generally it is done through FFT and magnitude
+    % computation (optionally IFFT, but rarely) because it's simpler 
+    % both computationally and conceptually.
     
+    %% -- setup
     C = 343;
-    freq_min = 300;
-    freq_max = 3300;
-
     G = size(gridAnglePairs, 1);
     [L, M] = size(rxSignal);
-    fft_bin_min = floor(freq_min * L / fs);
-    fft_bin_max = floor(freq_max * L / fs);
-    fft_bins_n = fft_bin_max - fft_bin_min + 1;
-    rx_fft = zeros(fft_bins_n, M);
-    w = 1/M;
-    taus = zeros(G, M);
-
-    % POPRAWKA: pierwszy mikrofon jako referencja
-    % dla każdego kierunku i każdego mikrofonu obliczamy opóźnienie
-    for m = 1:M
-        % Różnica pozycji względem pierwszego mikrofonu
-        d = (micsPositions(:, m) - micsPositions(:, 1));  % [3 x 1]
-        
-        % Dla każdego kierunku w siatce
-        % gridDirVectors to [3 x G], więc gridDirVectors' to [G x 3]
-        % d to [3 x 1]
-        % Wynik: [G x 3] * [3 x 1] = [G x 1]
-        taus(:, m) = (gridDirVectors' * d) / C;  % FIX: poprawne mnożenie macierzowe
-    end
+    %w = 1/(M*M);
     
-    % Pierwszy mikrofon ma oczywiście tau = 0 dla wszystkich kierunków
-    % (to już jest zapewnione powyżej, bo d = 0 dla m=1)
+    %% -- compute fft
+    rx_fft = fft(rxSignal);
 
-    % FFT każdego kanału
-    for m = 1:M
-        tmp_fft = fft(rxSignal(:, m));
-        rx_fft(:,m) = tmp_fft(fft_bin_min:fft_bin_max);
-    end
+    %% -- compute power per direction with bandpass filtering
+    f_min = 300;
+    f_max = 3000;
+    freqs_all = (0:(L-1))' * fs/L;
+    freq_mask = (freqs_all >= f_min) & (freqs_all <= f_max);
+    freqs_filt = freqs_all(freq_mask);
+    rx_fft_filt = rx_fft(freq_mask, :);
+    
+    power_spec = zeros(G, 1);
 
-    % Dla każdego kierunku w siatce
+    % for each direction g...
     for g = 1:G
-        freq_spec = zeros(fft_bins_n, 1);
-        freqs = (fft_bin_min:fft_bin_max)' * fs / L;  % częstotliwości dla tych binów
-        
+        Y_sum = zeros(length(freqs_filt), 1);
+
         for m = 1:M
-            % Delay-and-sum: kompensujemy opóźnienie dla danego kierunku
-            freq_spec = freq_spec + w * rx_fft(:, m) .* ...
-                        exp(-1j * 2 * pi * freqs * taus(g, m));
+            Y_sum = Y_sum + ...
+                rx_fft_filt(:, m) .* exp(-1j * 2 * pi * freqs_filt * taus(g, m));
         end
         
-        % Moc sygnału dla tego kierunku
-        power_spec(g) = sum(abs(freq_spec).^2);
+        power_spec(g) = sum(real(Y_sum));
+
     end
 
-    % Znajdź maksimum
+    power_spec = power_spec / max(abs(power_spec));
+
+    %% -- find max 
     [~, max_idx] = max(power_spec);
     az = rad2deg(gridAnglePairs(max_idx, 1));
     el = rad2deg(gridAnglePairs(max_idx, 2));
     
-    % Zwróć dodatkowe info
+    %% -- other stuff
     info = struct('maxPower', power_spec(max_idx), ...
                   'maxIndex', max_idx, ...
-                  'powerSpectrum', power_spec);  % dodane pełne spektrum
+                  'powerSpectrum', power_spec);
 end

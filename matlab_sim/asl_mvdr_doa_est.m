@@ -1,43 +1,55 @@
 function [az, el, spec] = asl_mvdr_doa_est(rxSignal, micsPositions, ...
                                         gridAnglePairs, gridSpherical, ...
                                         fs, lambda0)
-    %% params setup
     C = 343;
     f_0 = C/lambda0;
-    f_bw_half = 250/2;
-    [L, M] = size(rxSignal);
+    f_bw_half = 125;
+    f_low = f_0 - f_bw_half;
+    f_high = f_0 + f_bw_half;
+
+    [N_samples, M] = size(rxSignal);  % N_samples=1024, M=16 mikrofonów
     G = size(gridAnglePairs, 1);
     spec = zeros(G, 1);
-    epsilon = 1e-6;
-       
-    %% passband filter to obtain narrowband sig from lambda0 arg
-    [b, a] = butter(4, [((f_0 - f_bw_half)/(fs/2)), ...
-                        ((f_0 + f_bw_half)/(fs/2))], 'bandpass');
-    rxSignal_filt = zeros(size(rxSignal));
-    for m = 1:M
-        rxSignal_filt(:, m) = filter(b, a, rxSignal(:, m));
-    end
+    
+    %% Filtrowanie - ZOSTAW ZESPOLONE!
+    rxSig_fft = fft(rxSignal, [], 1);  % FFT wzdłuż sampli (dim=1)
+    freq_axis = (0:N_samples-1) * fs / N_samples;
+    freq_mask = (freq_axis >= f_low) & (freq_axis <= f_high);
+    rxSig_fft(~freq_mask, :) = 0;  % Zeruj wiersze (częstotliwości)
+    rxSignal_filt = ifft(rxSig_fft, [], 1);  % NIE bierz real()!
 
-    %% autocorr matrix
-    Rx = (rxSignal_filt' * rxSignal_filt) / L;
+    %% Macierz korelacji [M × M]
+    Rx = (rxSignal_filt' * rxSignal_filt) / N_samples;
+    % rxSignal_filt: [1024 × 16]
+    % rxSignal_filt': [16 × 1024] (transpozycja sprzężona)
+    % Iloczyn: [16 × 1024] × [1024 × 16] = [16 × 16] ✓
+    
+    Rx = (Rx + Rx') / 2;  % Hermitianizacja
+    
+    epsilon = 1e-4 * trace(real(Rx)) / M;
     Rx = Rx + epsilon * eye(M);
-    % diagonal loading? co to jest
     Rx_inv = inv(Rx);
 
-    %% MVDR spectrum calc, start with steering vecs
-    a = zeros(M, 1);
+    %% Steering vectors
+    mic_centre = mean(micsPositions, 2);
+    
     for g = 1:G
+        dir_vec = gridSpherical(:, g);
+        
+        a = zeros(M, 1);
         for m = 1:M
-            tau = micsPositions(:, m)' * gridSpherical(:, g) / C;
-            a(m) = exp(1j * 2 * pi * f_0 * tau);
+            delta_pos = micsPositions(:, m) - mic_centre;
+            tau = (delta_pos' * dir_vec) / C;
+            a(m) = exp(-1j * 2 * pi * f_0 * tau);
         end
-
-        %a = a / sqrt(M); % normalize?
+        
+        a = a / sqrt(a' * a);
         spec(g) = 1 / real(a' * Rx_inv * a);
     end
 
-    [~, max_idx] = max(spec(:));
+    % [~, max_idx] = max(spec(:));
+    [~, XI] = maxk(spec(:), 2);
+    max_idx = XI(1);
     az = rad2deg(gridAnglePairs(max_idx, 1));
     el = rad2deg(gridAnglePairs(max_idx, 2));
-
 end

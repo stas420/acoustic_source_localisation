@@ -4,17 +4,16 @@ AGH eng. thesis project - acoustic source localisation algo overview, tests and 
 # matlab_sim
 
 Here I keep MATLAB 2025Rb code of ASL algos simulations:
-- Delay-and-Sum  *(in progress)*
+- Delay-and-Sum as DoA estimator
 - SRP-PHAT
 - MUSIC 
-- MVDR adaptive beamforming  *(in progress)*
-- Maximum Entropy/Maximum Likelihood  *(TODO)*
+- MVDR as DoA estimator
 
 Used toolboxes:
 - Audio Toolbox
 - DSP Toolbox
 - Phased Array Toolbox
-- Communications Toolbox (*to be verified*)
+- Communications Toolbox
 
 # srp_phat_impl
 
@@ -37,26 +36,23 @@ On Linux you'd probably want to do it the same way, but run `cmake` as usual and
 
 # stm_code
 
-In this directory, an STM32CubeIDE project is held. This is a complete code for STM32 H563ZI (ARM Cortex M33) for data acquisition from 16 mics from dedicated FPGA through SPI, and for DoA calculations based on that. ~~It uses **[CMSIS-DSP](https://github.com/ARM-software/CMSIS-DSP)** precompiled library for maths and Q31 arithmetics, which is included in `/Drivers/CMSIS/DSP`.~~ It uses kissfft, same as the above PoC implementation. The results computed for test data on the device are the same for both PoC and STM version. 
+In this directory, an STM32CubeIDE project is held. This is a complete code for STM32 H563ZI (ARM Cortex M33) for data acquisition from 16 mics from dedicated FPGA through SPI, and for DoA calculations based on that. It uses kissfft, same as the above PoC implementation. The results computed for test data on the device are the same for both PoC and STM version. 
 
 Device's SRAM usage: ~20%
-Device's flash mem usage: ~2%
-Time needed for `srp_phat()`: from ~20s for -90:90 grids, R=10 and 1024 frame, to ~5s for -75:75 and -45:45 grid, R=15, 512 frame 
 
-*It, then, will transmit estimated DoA angles through UART to connected PC with dedicated Python script.* <-- TODO
+Device's flash mem usage: ~2%
+
+Time needed for `srp_phat()`: from ~20s (for -90:90 grids, R=10 and 1024-sample long frame), to ~5s (for -75:75 and -45:45 grid, R=15, 512-sample long frame) 
+
+*It, then, will transmit estimated DoA angles through UART to connected PC with dedicated Python script. So far, the data is read using built-in debugger in STM32CubeIDE*
 
 ### how to build: 
 
 1. install STM32CubeIDE
 2. open `stm_code` as a workspace
 3. inside the workspace open/import this project 
-4. check, just to be sure, the build configuration:
-    - in the project tree: *asl_demo* -> right-click -> Properties -> C/C++ Build -> Settings -> Tool Settings -> MCU/MPU GCC Compiler -> Include paths -> Include paths (-I) -- there should be an entry like `"${workspace_loc:/${ProjName}/Drivers/CMSIS/DSP/Include}"`
-    - in the project tree: *asl_demo* -> right-click -> Properties -> C/C++ Build -> Settings -> Tool Settings -> MCU/MPU GCC Linker -> Libraries:
-        - in Library search, there should be an entry like `"${workspace_loc:/${ProjName}/Drivers/CMSIS/DSP/Lib}"`
-        - in Libraries, there should be an entry like `CMSISDSP`
-5. to check the build only: *asl_demo.ioc* -> right-click -> build project
-6. to deploy on the device: connect STM32 device to the PC through USB-C -> in CubeIDE, click "Run"
-7. to deploy with debugger: connect STM32 device to the PC through USB-C -> in CubeIDE, click "Debug" 
+4. to check the build only: *asl_demo.ioc* -> right-click -> build project
+5. to deploy on the device: connect STM32 device to the PC through USB-C -> in CubeIDE, click "Run"
+6. to deploy with debugger: connect STM32 device to the PC through USB-C -> in CubeIDE, click "Debug" 
     - if you want breakpoints, double click on the line number, where you want the debugger to stop
     - if you want to check some global variables, in Expressions tab just insert the variable name

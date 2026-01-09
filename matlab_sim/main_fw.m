@@ -11,8 +11,10 @@ d = 0.042;          % odległości w pionie i poziomie między mikrofonami
 M_row_line = 4;     % ilość mikrofonów w kolumnie i wierszu
 M = M_row_line * M_row_line; % łączna ilość mikrofonów w macierzy
 
+snr_target_db = 10;
+
 %% ---- macierz, pokój i ich geometrie ----
-% wzór mikrofonu: Adafruit PDM MEMS Omni mic 3492 (Botland) 
+% wzór mikrofonu: InvenSense (TDK) ICS-41350
 % -- ważne: tu nie robię filtrowania PDM->PCM, zakładam, że dostaję od razu
 % --        gotowy sygnał dźwiękowy do przetwarzania
 mic_element = phased.OmnidirectionalMicrophoneElement("FrequencyRange", ...
@@ -31,7 +33,8 @@ mic_array_centre = mean(mic_positions_absolute, 2);
 % w środku macierzy, a on znajduje się w punkcie 0,0,0 (zgodnie z
 % dokumentacją phased.URA)
 room_dim = [4; 4; 3]; % przykładowe wymiary pokoju
-source_pos = [1.9; -0.3; 0.9]; % przykładowa pozycja źródła
+%source_pos = [3.38; 1.9; 1.7]; % przykładowa pozycja źródła
+source_pos = mic_array_centre + [2; 1; 2];
 
 mic_normals = zeros(2,M);
 mic_normals(1,:) = 0;
@@ -39,7 +42,7 @@ mic_normals(2,:) = 0;
 mic_array_conf = phased.ConformalArray('Element', mic_element, ...
                    'ElementPosition', mic_positions_absolute, ...
                    'ElementNormal', mic_normals);
-mic_array_conf_pos_check = getElementPosition(mic_array_conf);
+%mic_array_conf_pos_check = getElementPosition(mic_array_conf);
 
 % mic_positions_absolute(1,:) = mic_positions_relative(1,:) + mic_array_change(1);
 % mic_positions_absolute(2,:) = mic_positions_relative(2,:) + mic_array_change(2);
@@ -48,19 +51,28 @@ writematrix(mic_positions_absolute, 'mics.txt'); % export do testów implementac
 
 % okno Chebysheva, by poprawić tłumienie po bokach - bez tego jest trochę słabo
 % -- szersza główna wiązka, ale nam to nie przeszkadza
-taper = chebwin(M_row_line, 20);   % 20 dB tłumienia na linii 4 mikrofonów
+taper = chebwin(M_row_line, 30);   % 20 dB tłumienia na linii 4 mikrofonów
 taper2D = taper * taper'; % przejście do 2D
 mic_array.Taper = taper2D;% nakładam okno
 
+% wykres ukierunkowania macierzy dla zadanej częstotliwości 'f_check'
+% f_check = 3000;
+% pattern(mic_array, f_check, -90:90, 0, PropagationSpeed = C, ...
+%     CoordinateSystem = "rectangular", Type = "powerdb");
+
+
 % "echo" pokoju w formie odpowiedzi impulsowej, czyli de facto filtra FIR
 room_resp = acousticRoomResponse(room_dim', source_pos', ...
-    mic_positions_absolute', "SampleRate", f_s, "SoundSpeed", C);
+          mic_positions_absolute', "SampleRate", f_s, "SoundSpeed", C, ...
+          'MaterialAbsorption', [0.03 0.03 0.03 0.03 0.05 0.05]' );
 
 %% ---- przygotowanie sygnału i jego obróbki ----
 % kąty padania, na razie uproszczone obliczenia
 pos_diff = source_pos - mic_array_centre;
 az = rad2deg(atan2(pos_diff(2), pos_diff(1)));
 el = rad2deg(atan2(pos_diff(3), sqrt(pos_diff(1)^2 + pos_diff(2)^2)));
+az_rad = deg2rad(az);
+el_rad = deg2rad(el);
 
 % WidebandCollector symuluje przesunięcia fazowe na każdym z elementów
 % macierzy i nie obcina przy tym pasma
@@ -69,17 +81,22 @@ wide_collector = phased.WidebandCollector("Sensor", mic_array_conf, ...
     "ModulatedInput", false, 'SampleRate', f_s, 'Polarization', 'None');
 
 % przykładowy sygnał, tj. sinusy z zakresu mowy
-t = (0:(1/f_s):((L-1)/f_s))';
-freqs = [350, 700, 999, 1111, 3000];
-sig = zeros(length(t), 1);
+% t = (0:(1/f_s):((L-1)/f_s))';
+% freqs = [350, 700, 999, 1111, 3000];
+% sig = zeros(length(t), 1);
+% 
+% for f = freqs
+%     sig = sig + sin(2 * pi * f * t);
+% end
 
-for f = freqs
-    sig = sig + sin(2 * pi * f * t);
-end
+% sygnał biały z zakresu mowy
+t = (0:(1/f_s):((L-1)/f_s))';
+sig = randn(length(t), 1);
+sig = sig / norm(sig);
+
 
 % przygotowanie drobnego szumu do dodania później
 sig_pow = var(sig);
-snr_target_db = 55;
 snr_target = 10^(snr_target_db/10);
 noise_var = sig_pow/snr_target;
 noise = sqrt(noise_var) * randn(size(sig));
@@ -100,8 +117,8 @@ ura_rx_rev_noise = zeros(L, M);
 
 for m = 1:M
     % filter, czyli nakładamy odpowiedź pokoju jako FIR (stąd mianownik 1)
-    ura_rx_rev(:, m) = ura_rx(:, m); %filter(room_resp(m, :)', 1, ura_rx(:, m)); << TODO, it destroys everything
-    ura_rx_rev_noise(:, m) = ura_rx_rev(:, m) + noise; % << check if it also destroys everything....
+    ura_rx_rev(:, m) = ura_rx(:,m); %filter(room_resp(m, :)', 1, ura_rx(:, m)); % << 
+    ura_rx_rev_noise(:, m) = ura_rx_rev(:, m);% + noise; % << check if it also destroys everything....
 end
 
 % LPF pro forma
@@ -133,35 +150,42 @@ el_grid = deg2rad(-45:5:45);
 G_deg_pairs = [az_mesh(:), el_mesh(:)];
 G_spherical_vec = az_el_to_spherical_vec(G_deg_pairs(:, 1), G_deg_pairs(:, 2));
 
-% Pre-compute dla SRP-PHAT (opcjonalne, przyspiesza przy wielokrotnym użyciu)
+%% -- delay-and-sum --
+% tablice LUT dla DaS, bo jest nimi obciążany
+das_taus = das_precomp(mic_positions_absolute, ura_rx_rev_noise_low, ...
+                        G_spherical_vec, G_deg_pairs, C);
+
+[das_az, das_el, das_info] = asl_das_doa_est(ura_rx_rev_noise_low, ...
+                                             G_deg_pairs, f_s, das_taus);
+
+fprintf('DAS: (%.1f, %.1f), True=(%.1f, %.1f)\n', ...
+    das_az, das_el, az, el);
+
+%% -- SRP-PHAT --
+
+% tablice LUT dla SRP-PHAT, bo jest nimi mocno obciążony przy wielokrotnym
+% odpalaniu
 srp_precomp = srp_precompute(mic_positions_absolute, G_spherical_vec, ...
     f_min, f_max, f_s, L, C);
 
-%% -- delay-and-sum --
-[das_az, das_el, das_info] = asl_das_doa_est(ura_rx_rev_noise_low, ...
-                             mic_positions_absolute, G_deg_pairs, ...
-                             G_spherical_vec, f_s);
-% Normalizacja kątów (opcjonalnie, jeśli chcesz sprawdzić poprawność)
-[das_az_norm, das_el_norm] = normalize_doa_angles(das_az, das_el, az, el);
-fprintf('DAS: Raw=(%.1f, %.1f), Normalized=(%.1f, %.1f), True=(%.1f, %.1f)\n', ...
-    das_az, das_el, das_az_norm, das_el_norm, az, el);
 
-%% -- SRP-PHAT -- << done, working, now optimized
 [srp_phat_az, srp_phat_el, srp_phat_info] = asl_srp_phat(ura_rx_rev_noise_low, ... 
     mic_positions_absolute, f_min, f_max, f_s, G_deg_pairs, G_spherical_vec, C, L, srp_precomp);
-[srp_phat_az_norm, srp_phat_el_norm] = normalize_doa_angles(srp_phat_az, srp_phat_el, az, el);
-fprintf('SRP-PHAT: Raw=(%.1f, %.1f), Normalized=(%.1f, %.1f), True=(%.1f, %.1f)\n', ...
-    srp_phat_az, srp_phat_el, srp_phat_az_norm, srp_phat_el_norm, az, el);
 
-%% -- MUSIC -- << done, almost working - angles conv to be checked
+fprintf('SRP-PHAT: (%.1f, %.1f), True=(%.1f, %.1f)\n', ...
+    srp_phat_az, srp_phat_el, az, el);
+
+%% -- MUSIC --
 lambda_0 = C/f_0;
+
 [music_az, music_el, music_info] = asl_music_2d(ura_rx_rev_noise_low, ...
-    lambda_0, d, M_row_line, 1, G_deg_pairs);
-[music_az_norm, music_el_norm] = normalize_doa_angles(music_az, music_el, az, el);
-fprintf('MUSIC: Raw=(%.1f, %.1f), Normalized=(%.1f, %.1f), True=(%.1f, %.1f)\n', ...
-    music_az, music_el, music_az_norm, music_el_norm, az, el);
+    lambda_0, mic_positions_absolute, 1, G_deg_pairs, G_spherical_vec, f_s);
+
+fprintf('MUSIC: (%.1f, %.1f), True=(%.1f, %.1f)\n', ...
+    music_az, music_el, az, el);
 
 %% -- MVDR --
 [mvdr_az, mvdr_el, mvdr_spec] = asl_mvdr_doa_est(ura_rx_rev_noise_low, ...
     mic_positions_absolute, G_deg_pairs, G_spherical_vec, f_s, lambda_0);
+
 fprintf('MVDR: (%.1f, %.1f), True=(%.1f, %.1f)\n', mvdr_az, mvdr_el, az, el);
